@@ -1,0 +1,12 @@
+You are a senior build engineer. I will paste your output into a single shell file named fix.sh and run it.
+Produce one Bash script that:
+	•	Audits first, then patches my existing project in place (no assumptions about tech stack).
+	•	Works on macOS and Linux (handle BSD/GNU tools), is idempotent, and non-interactive.
+	•	Finds the project root automatically, discovers modules and package layout, and never creates duplicate folders.
+	•	Reads existing files before editing (use safe regex/search). If a file/section is missing, create only what’s necessary.
+	•	Can patch a section, replace a whole file, or create new files — whichever is appropriate from the audit.
+	•	Preserves custom code and only fixes what’s broken/incomplete (dependencies, plugins, config, source skeletons, resources, etc.).
+	•	Provides generic helpers (ensure dir, safe in-place edit, backup-once, replace-or-append, write-if-absent/empty).
+	•	Makes no tech choices unless I’ve asked (don’t assume libraries, processors, or file names). If a feature was explicitly requested earlier, keep it; otherwise leave it unchanged.
+	•	Never hardcode names or paths beyond what the audit discovers (derive module names, package names, and locations dynamically).
+	•	Prints a short summary of what changed and next steps.
