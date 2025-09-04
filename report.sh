@@ -101,62 +101,79 @@ gen_errors() {
   : > "$OUT_ERRORS"
   local BUILD_LOG="$PACK_DIR/.build.log"
 
+  # بیلد با لاگ کامل
   if [ -x ./gradlew ]; then
-    ./gradlew build >"$BUILD_LOG" 2>&1 || true
+    ./gradlew build --stacktrace --warning-mode=all >"$BUILD_LOG" 2>&1 || true
   else
     echo "No build errors." > "$OUT_ERRORS"
     echo "." >> "$OUT_ERRORS"
     return 0
   fi
 
-  # If no failure markers → no errors
-  if ! grep -qE "FAILURE:|\berror:|^e: " "$BUILD_LOG" 2>/dev/null; then
+  # اگر عملاً خطایی دیده نمی‌شود
+  if ! grep -qEi "FAILURE:|(^|[[:space:]])e: |(^|[[:space:]])error:|Could not |BUILD FAILED" "$BUILD_LOG" 2>/dev/null; then
     echo "No build errors." >> "$OUT_ERRORS"
     echo "." >> "$OUT_ERRORS"
     return 0
   fi
 
-  # Capture references like foo.kts:37 OR foo.kt:37 OR foo.java/xml:37
-  local refs="$PACK_DIR/.build.refs"
-  grep -Eo "([./][^ :'\"]+|/[^ :'\"]+)\.(kts|kt|java|xml):[0-9]+" "$BUILD_LOG" 2>/dev/null \
-    | sed -E "s#^$PWD/##" | awk '!seen[$0]++' > "$refs" || true
+  # 1) ارجاع‌های file:line که واقعاً داخل پروژه‌اند (kts/kt/java/xml/gradle/pro)
+  #   - اول همه‌ی refها را بگیر
+  local all_refs="$PACK_DIR/.all.refs"
+  grep -Eo "([./][^ :'\"]+|/[^ :'\"]+)\.(kts|kt|java|xml|gradle|pro):[0-9]+" "$BUILD_LOG" 2>/dev/null \
+    | sed -E "s#^$PWD/##" > "$all_refs" || true
 
-  # Helper: extract a cleaner message + 2 lines of context after the match
+  #   - فقط آن‌هایی که فایل‌شان در پروژه واقعاً وجود دارد را نگه دار
+  local refs="$PACK_DIR/.refs.filtered"; : > "$refs"
+  if [ -s "$all_refs" ]; then
+    awk '!seen[$0]++' "$all_refs" | while IFS= read -r ref; do
+      file="${ref%:*}"
+      rel="${file#./}"; [ -f "$file" ] || file="./$rel"
+      # حذف مسیرهایی که خارج از پروژه‌اند یا فایل ندارند
+      if [ -f "$file" ] && printf "%s" "$file" | grep -qE "^\./"; then
+        echo "$ref" >> "$refs"
+      fi
+    done
+  fi
+
+  # کمک‌تابع: پیام + ۲ خط کانتکست بعد از خط match
   extract_message_with_context() {
     local file_rel="$1" line="$2" m msg_core ctx
     m="$(grep -n -E "($file_rel(:$line)?)([^[:alnum:]]|$)" "$BUILD_LOG" 2>/dev/null | head -n1 | sed -E 's/^[0-9]+://')"
-    # Fallback: any line that has "error:" near the file
     [ -z "$m" ] && m="$(grep -E "(error:|^e: ).*$file_rel" "$BUILD_LOG" 2>/dev/null | head -n1)"
-
     if printf "%s" "$m" | grep -qi "error:"; then
       msg_core="$(printf "%s" "$m" | sed -E 's/.*[Ee]rror:[[:space:]]*//')"
     else
       msg_core="$(printf "%s" "$m" | sed -E "s#^.*$file_rel(:[0-9]+(:[0-9]+)?)?:[[:space:]]*##")"
     fi
-
-    # Also take the next up-to-2 lines after the matched one for context
-    # (Search the exact matched line string, then print next 2)
     local esc; esc="$(printf "%s" "$m" | sed 's/[.[\*^$()+?{}|/\\]/\\&/g')"
-    ctx="$(awk -v pat="$esc" 'found==0 && index($0, pat)>0 {found=1; next}
-                              found>0 && ctx<2 {print; ctx++}' "$BUILD_LOG" 2>/dev/null)"
+    ctx="$(awk -v pat="$esc" 'f==0 && index($0,pat)>0 {f=1; next} f>0 && n<2 {print; n++}' "$BUILD_LOG" 2>/dev/null)"
     printf "%s\n%s" "$msg_core" "$ctx" | sed 's/\r$//'
   }
 
-  local printed=false
+  printed=false
+  seen_keys=""  # برای دِدیوپ
+
+  # الف) چاپ بلاک‌های file:line فقط برای فایل‌های واقعی پروژه
   if [ -s "$refs" ]; then
     while IFS= read -r ref; do
       [ -z "$ref" ] && continue
-      local file="${ref%:*}"
-      local line="${ref##*:}"
-      local file_rel; file_rel="$(relpath "$file")"
+      file="${ref%:*}"; line="${ref##*:}"
+      file_rel="$(relpath "$file")"
       [ -f "$file" ] || file="./$file_rel"
 
-      local msg; msg="$(extract_message_with_context "$file_rel" "$line")"
+      msg="$(extract_message_with_context "$file_rel" "$line")"
+      msg_first="$(printf "%s" "$msg" | head -n1)"
 
-      # Code snippet: ±20 lines around the error
-      local start=$(( line>20 ? line-20 : 1 ))
-      local end=$(( line+20 ))
-      local code; code="$(awk -v s="$start" -v e="$end" 'NR>=s && NR<=e {print}' "$file" 2>/dev/null)"
+      key="F|$file_rel|$line|$msg_first"
+      case ",$seen_keys," in
+        *",$key,"*) continue ;;
+      esac
+      seen_keys="$seen_keys,$key"
+
+      start=$(( line>20 ? line-20 : 1 ))
+      end=$(( line+20 ))
+      code="$(awk -v s="$start" -v e="$end" 'NR>=s && NR<=e {print}' "$file" 2>/dev/null)"
 
       {
         printf "Error in: %s\n" "$file_rel"
@@ -171,12 +188,63 @@ gen_errors() {
     done < "$refs"
   fi
 
-  # General failure but no file:line refs → still give minimal failure lines
+  # ب) بلاک‌های Task (بدون file:line) — فشرده و یکتا، بدون استک‌تریس
+  #   واژه‌های ممنوعهٔ استک‌تریس را حذف می‌کنیم تا تکرارها نیاید
+  local task_blocks="$PACK_DIR/.task.blocks"
+  awk '
+    /^> Task / { if (cur!="") print cur; cur=$0; next }
+    { cur=cur ORS $0 }
+    END{ if (cur!="") print cur }
+  ' "$BUILD_LOG" > "$task_blocks" 2>/dev/null || true
+
+  if [ -s "$task_blocks" ]; then
+    while IFS= read -r -d '' block; do
+      title="$(printf "%s" "$block" | sed -n '1p')"
+      msgs="$(printf "%s" "$block" \
+        | grep -E "error:|^e: |Element type |is missing|not found|duplicate|Cannot find|Could not |FAILURE:" \
+        | grep -Ev "\.gradle\.|\.internal\.|\.xerces\.|\.DefaultBuildOperationRunner|\.Execute|\.java:[0-9]+" \
+        | sed -E 's/^[[:space:]]+//')"
+
+      [ -n "$msgs" ] || continue
+      first_msg="$(printf "%s" "$msgs" | head -n1)"
+
+      key="T|$title|$first_msg"
+      case ",$seen_keys," in
+        *",$key,"*) continue ;;
+      esac
+      seen_keys="$seen_keys,$key"
+
+      # تلاش برای Manifest
+      mani_path="$(printf "%s" "$block" | grep -Eo "([./][^ :'\"]+|/[^ :'\"]+)/AndroidManifest\.xml" | head -n1)"
+      [ -n "$mani_path" ] || mani_path="$(find . -name AndroidManifest.xml | head -n1 || true)"
+      snip=""
+      if [ -f "$mani_path" ]; then
+        lnno="$(nl -ba "$mani_path" | grep -n "<action" 2>/dev/null | head -n1 | cut -d: -f1)"
+        if [ -n "$lnno" ]; then
+          a=$(( lnno>20 ? lnno-20 : 1 ))
+          b=$(( lnno+20 ))
+          snip="$(awk -v s="$a" -v e="$b" 'NR>=s && NR<=e {print}' "$mani_path" 2>/dev/null)"
+        fi
+      fi
+
+      {
+        printf "Error in: %s\n" "$( [ -n "$mani_path" ] && relpath "$mani_path" || echo "(no file path)" )"
+        printf "Message: %s\n" "$first_msg"
+        printf "Code:\n%s\n" "${snip:-}"
+        printf "Full Content:\n"
+        [ -f "$mani_path" ] && cat "$mani_path" || true
+        printf "\n---\n"
+      } >> "$OUT_ERRORS"
+
+      printed=true
+    done < <(awk 'BEGIN{RS="";ORS="\0"}{print}' "$task_blocks")
+  fi
+
+  # ج) اگر هیچ‌چیز چاپ نشد، خلاصهٔ عمومی
   if ! $printed; then
     {
       echo "Error in: (no file path)"
-      # Show a concise subset of failure lines
-      grep -E "^(FAILURE:|\* What went wrong:|Caused by:|> Could not |Could not )" "$BUILD_LOG" 2>/dev/null | head -n 60
+      grep -E "^(FAILURE:|\* What went wrong:|Caused by:|> Could not |Could not )" "$BUILD_LOG" 2>/dev/null | head -n 80
       echo "Message: (see lines above)"
       echo "Code:"
       echo
@@ -193,10 +261,12 @@ gen_errors() {
 gen_sync() {
   : > "$OUT_SYNC"
   local SYNC_LOG="$PACK_DIR/.sync.log"
+
   if [ -x ./gradlew ]; then
     ./gradlew --stacktrace --warning-mode=all tasks >"$SYNC_LOG" 2>&1 || true
-    if grep -qE "FAILURE:|\* What went wrong:|Caused by:|> Could not |Plugin [^ ]+ not found|Could not resolve|Version .* not found|Dependency .* not found|error:" "$SYNC_LOG" 2>/dev/null; then
-      grep -E "^(FAILURE:|\* What went wrong:|Caused by:|> Could not |Plugin [^ ]+ not found|Could not resolve|Version .* not found|Dependency .* not found|error:)" "$SYNC_LOG" 2>/dev/null \
+    # همه‌ی انواع ارورهای کانفیگ/دیپندنسی/پلاگین
+    if grep -qEi "FAILURE:|\* What went wrong:|Caused by:|Plugin [^ ]+ not found|Could not resolve|Version .* not found|Dependency .* not found|Invalid plugin|Problem occurred|error:" "$SYNC_LOG"; then
+      grep -Ei "^(FAILURE:|\* What went wrong:|Caused by:|Plugin [^ ]+ not found|Could not resolve|Version .* not found|Dependency .* not found|Invalid plugin|Problem occurred|error:)" "$SYNC_LOG" \
         | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//' \
         | awk '{print "Sync Error: "$0"\n---"}' >> "$OUT_SYNC"
     else
