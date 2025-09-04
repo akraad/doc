@@ -1,310 +1,271 @@
 #!/usr/bin/env bash
-# report.sh — Minimal, robust pack builder for AI debugging (macOS, zsh/bash).
-# Produces: ai-pack/R-Content.txt, R-Error.txt, R-Sync.txt, R-Root.txt
-# - Never crashes on missing files or no errors
-# - Relative paths only
-# - Detects errors from .kts/.kt/.java/.xml and includes code/context/full file
+# report.sh — Robust, parse-friendly report generator (macOS bash/zsh).
+# Outputs:
+#   ai-pack/R-Content.txt  ai-pack/R-Error.txt  ai-pack/R-Sync.txt  ai-pack/R-Root.txt
+# Safe: no deletions, no edits. Works in any Android Studio project.
 
-# -------------------- Setup --------------------
+set +e
+export LC_ALL=C
+
 PACK_DIR="ai-pack"
 OUT_CONTENT="$PACK_DIR/R-Content.txt"
 OUT_ERRORS="$PACK_DIR/R-Error.txt"
 OUT_SYNC="$PACK_DIR/R-Sync.txt"
 OUT_TREE="$PACK_DIR/R-Root.txt"
+mkdir -p "$PACK_DIR" >/dev/null 2>&1 || true
 
-mkdir -p "$PACK_DIR" 2>/dev/null || true
-
-# -------------------- Helpers --------------------
-relpath() {
-  local p="${1:-}"
-  case "$p" in
-    /*) p="${p#"$PWD/"}" ;;
-  esac
-  p="${p#./}"
-  printf "%s" "$p"
-}
-
-print_block() { # Path/File/Content block for R-Content
-  local f="$1"
-  [ -f "$f" ] || return 0
-  local rp; rp="$(relpath "$f")"
+# -------- helpers --------
+rel() { local p="${1:-}"; case "$p" in /*) p="${p#"$PWD/"}";; esac; printf "%s" "${p#./}"; }
+abspath() { local p="${1:-}"; case "$p" in /*) printf "%s" "$p";; *) printf "%s/%s" "$PWD" "${p#./}";; esac; }
+print_block() { # Path/File/Content → R-Content
+  local f="$1"; [ -f "$f" ] || return 0
+  local rp; rp="$(rel "$f")"
   {
     printf "Path: %s\n" "$rp"
     printf "File: %s\n" "$(basename "$f")"
     printf "Content:\n"
     cat "$f" 2>/dev/null || true
     printf "\n---\n"
-  } >> "$OUT_CONTENT" 2>/dev/null || true
+  } >> "$OUT_CONTENT"
 }
+snippet() { local f="$1" l="$2"; [ -f "$f" ] || return 0; local a=$(( l>20 ? l-20 : 1 )); local b=$(( l+20 )); awk -v s="$a" -v e="$b" 'NR>=s&&NR<=e{print}' "$f" 2>/dev/null; }
+clean_firstmsg() { sed -E 's/.*[Ee]rror:[[:space:]]*//; s/^[[:space:]]+//; s/[[:space:]]+$//' | head -n1; }
 
-# Detect project/package tail (best-effort, never fail)
+# -------- detect package tail (best-effort) --------
 project_name="$(basename "$PWD" 2>/dev/null || echo project)"
-app_id="$(grep -Rho --include='build.gradle' --include='build.gradle.kts' "applicationId[[:space:]]\+['\"][^'\"]\+['\"]" . 2>/dev/null \
-         | head -n1 | sed -E 's/.*["'\'']([^"'\'']+)["'\''].*/\1/' 2>/dev/null)"
-pkg_tail="$project_name"
-[ -n "$app_id" ] && pkg_tail="${app_id##*.}"
+app_id="$(grep -Rho --include='build.gradle' --include='build.gradle.kts' "applicationId[[:space:]]+['\"][^'\"]+['\"]" . 2>/dev/null | head -n1 | sed -E 's/.*["'\'']([^"'\'']+)["'\''].*/\1/')" || true
+pkg_tail="${app_id##*.}"; [ -n "$pkg_tail" ] || pkg_tail="$project_name"
 
-# Collect candidate roots & targets (don’t fail if empty)
+# -------- locate source roots & targets (for package scan) --------
 src_roots="$PACK_DIR/.srcroots.list"
-find . -type d \( -path "*/src/main/java" -o -path "*/src/main/kotlin" -o -path "*/src/*/java" -o -path "*/src/*/kotlin" \) \
-  2>/dev/null | sort -u > "$src_roots"
+find . -type d \( -path "*/src/main/java" -o -path "*/src/main/kotlin" -o -path "*/src/*/java" -o -path "*/src/*/kotlin" \) 2>/dev/null | sort -u > "$src_roots"
 
-targets_file="$PACK_DIR/.targets.list"
-: > "$targets_file"
-# prefer com/example/<pkg_tail>
-while IFS= read -r r; do
-  [ -d "$r/com/example/$pkg_tail" ] && printf "%s\n" "$r/com/example/$pkg_tail" >> "$targets_file"
-done < "$src_roots"
-# then com/example
-if [ ! -s "$targets_file" ]; then
-  while IFS= read -r r; do
-    [ -d "$r/com/example" ] && printf "%s\n" "$r/com/example" >> "$targets_file"
-  done < "$src_roots"
-fi
-# then com
-if [ ! -s "$targets_file" ]; then
-  while IFS= read -r r; do
-    [ -d "$r/com" ] && printf "%s\n" "$r/com" >> "$targets_file"
-  done < "$src_roots"
-fi
+targets="$PACK_DIR/.targets.list"; : > "$targets"
+while IFS= read -r r; do [ -d "$r/com/example/$pkg_tail" ] && echo "$r/com/example/$pkg_tail"; done < "$src_roots" >> "$targets"
+if [ ! -s "$targets" ]; then while IFS= read -r r; do [ -d "$r/com/example" ] && echo "$r/com/example"; done < "$src_roots" >> "$targets"; fi
+if [ ! -s "$targets" ]; then while IFS= read -r r; do [ -d "$r/com" ] && echo "$r/com"; done < "$src_roots" >> "$targets"; fi
 
-# -------------------- 1) R-Content.txt --------------------
+# -------- 1) R-Content.txt --------
 gen_content() {
   : > "$OUT_CONTENT"
-  local col="$PACK_DIR/.content.files"; : > "$col"
 
-  # Only kt/java/xml under target package; if not found, fallback to all src/*
-  if [ -s "$targets_file" ]; then
+  # (A) تمام سورس‌های پکیج com/example/<pkg_tail> (kt/java/xml)
+  pkg_files="$PACK_DIR/.pkg.files"; : > "$pkg_files"
+  if [ -s "$targets" ]; then
     while IFS= read -r t; do
-      find "$t" -type f \( -name "*.kt" -o -name "*.java" -o -name "*.xml" \) 2>/dev/null
-    done < "$targets_file" >> "$col"
+      find "$t" -type f \( -name '*.kt' -o -name '*.java' -o -name '*.xml' \) 2>/dev/null
+    done < "$targets" >> "$pkg_files"
   fi
-  if [ ! -s "$col" ]; then
-    find . -path "*/src/*" -type f \( -name "*.kt" -o -name "*.java" -o -name "*.xml" \) 2>/dev/null >> "$col"
+  if [ ! -s "$pkg_files" ]; then
+    find . -path "*/src/*" -type f \( -name '*.kt' -o -name '*.java' -o -name '*.xml' \) 2>/dev/null >> "$pkg_files"
   fi
+  if [ -s "$pkg_files" ]; then sort -u "$pkg_files" | while IFS= read -r f; do print_block "$f"; done; fi
 
-  # Print code blocks
-  if [ -s "$col" ]; then
-    sort -u "$col" | while IFS= read -r f; do print_block "$f"; done
-  fi
-
-  # Also include the specified build files (skip silently if missing)
-  for f in ./app/build.gradle.kts ./build.gradle.kts ./settings.gradle.kts ./gradle/libs.versions.toml; do
-    [ -f "$f" ] && print_block "$f" || true
+  # (B) AndroidManifest.xml (قطعاً اضافه شود)
+  for mani in ./app/src/main/AndroidManifest.xml ./AndroidManifest.xml; do
+    [ -f "$mani" ] && print_block "$mani" || true
   done
 
-  printf ".\n" >> "$OUT_CONTENT" 2>/dev/null || true
+  # (C) تمام فایل‌های پوشه app/ (برای «جزییات کامل») — بدون فایل‌های باینری/دیتابیس
+  app_all="$PACK_DIR/.app.files"; : > "$app_all"
+  if [ -d ./app ]; then
+    find ./app -type f \
+      -not -path "*/build/*" \
+      -not -path "*/.gradle/*" \
+      -not -path "*/.idea/*" \
+      -not -path "*/.git/*" \
+      \
+      # تصاویر و فونت‌ها و باینری‌های رایج
+      -not -name "*.png" -not -name "*.jpg" -not -name "*.jpeg" -not -name "*.webp" \
+      -not -name "*.gif" -not -name "*.ico" -not -name "*.svg" \
+      -not -name "*.jar" -not -name "*.aar" -not -name "*.aab" -not -name "*.apk" \
+      -not -name "*.so"  -not -name "*.bin" -not -name "*.zip" -not -name "*.pdf" \
+      -not -name "*.ttf" -not -name "*.otf" -not -name "*.woff" -not -name "*.woff2" \
+      \
+      # دیتابیس‌ها و فایل‌های مرتبط (Room/SQLite/WAL/SHM/Realm/…)
+      -not -name "*.db" -not -name "*.sqlite" -not -name "*.sqlite3" \
+      -not -name "*.room" -not -name "*.realm" \
+      -not -name "*.wal" -not -name "*.shm" \
+      -not -path "*/assets/*/*.db" -not -path "*/assets/*/*.sqlite" -not -path "*/assets/*/*.sqlite3" \
+      2>/dev/null | sort -u > "$app_all"
+
+    if [ -s "$app_all" ]; then
+      while IFS= read -r f; do print_block "$f"; done < "$app_all"
+    fi
+  fi
+
+  # (D) بیلدفایل‌های کلیدی (kts & groovy) + settings + catalog + properties
+  for f in \
+    ./app/build.gradle.kts ./app/build.gradle \
+    ./build.gradle.kts ./build.gradle \
+    ./settings.gradle.kts ./settings.gradle \
+    ./gradle/libs.versions.toml \
+    ./gradle.properties
+  do [ -f "$f" ] && print_block "$f" || true; done
+
+  printf ".\n" >> "$OUT_CONTENT"
 }
 
-# -------------------- 2) R-Error.txt --------------------
+# -------- 2) R-Error.txt (dedup smart) --------
 gen_errors() {
   : > "$OUT_ERRORS"
-  local BUILD_LOG="$PACK_DIR/.build.log"
+  local LOG="$PACK_DIR/.build.log"
 
-  # بیلد با لاگ کامل
   if [ -x ./gradlew ]; then
-    ./gradlew build --stacktrace --warning-mode=all >"$BUILD_LOG" 2>&1 || true
+    ./gradlew -q :app:compileDebugKotlin --stacktrace --warning-mode=all >"$LOG" 2>&1 || true
+    ./gradlew -q :app:kspDebugKotlin     --stacktrace --warning-mode=all >>"$LOG" 2>&1 || true
+    ./gradlew    build                    --stacktrace --warning-mode=all >>"$LOG" 2>&1 || true
   else
-    echo "No build errors." > "$OUT_ERRORS"
-    echo "." >> "$OUT_ERRORS"
-    return 0
+    printf "No build errors.\n.\n" >> "$OUT_ERRORS"; return 0
   fi
 
-  # اگر عملاً خطایی دیده نمی‌شود
-  if ! grep -qEi "FAILURE:|(^|[[:space:]])e: |(^|[[:space:]])error:|Could not |BUILD FAILED" "$BUILD_LOG" 2>/dev/null; then
-    echo "No build errors." >> "$OUT_ERRORS"
-    echo "." >> "$OUT_ERRORS"
-    return 0
+  if ! grep -qEi "FAILURE:|(^|[[:space:]])e: |(^|[[:space:]])error:|Could not |Redeclaration|Unresolved reference|Conflicting overloads" "$LOG"; then
+    printf "No build errors.\n.\n" >> "$OUT_ERRORS"; return 0
   fi
-
-  # 1) ارجاع‌های file:line که واقعاً داخل پروژه‌اند (kts/kt/java/xml/gradle/pro)
-  #   - اول همه‌ی refها را بگیر
-  local all_refs="$PACK_DIR/.all.refs"
-  grep -Eo "([./][^ :'\"]+|/[^ :'\"]+)\.(kts|kt|java|xml|gradle|pro):[0-9]+" "$BUILD_LOG" 2>/dev/null \
-    | sed -E "s#^$PWD/##" > "$all_refs" || true
-
-  #   - فقط آن‌هایی که فایل‌شان در پروژه واقعاً وجود دارد را نگه دار
-  local refs="$PACK_DIR/.refs.filtered"; : > "$refs"
-  if [ -s "$all_refs" ]; then
-    awk '!seen[$0]++' "$all_refs" | while IFS= read -r ref; do
-      file="${ref%:*}"
-      rel="${file#./}"; [ -f "$file" ] || file="./$rel"
-      # حذف مسیرهایی که خارج از پروژه‌اند یا فایل ندارند
-      if [ -f "$file" ] && printf "%s" "$file" | grep -qE "^\./"; then
-        echo "$ref" >> "$refs"
-      fi
-    done
-  fi
-
-  # کمک‌تابع: پیام + ۲ خط کانتکست بعد از خط match
-  extract_message_with_context() {
-    local file_rel="$1" line="$2" m msg_core ctx
-    m="$(grep -n -E "($file_rel(:$line)?)([^[:alnum:]]|$)" "$BUILD_LOG" 2>/dev/null | head -n1 | sed -E 's/^[0-9]+://')"
-    [ -z "$m" ] && m="$(grep -E "(error:|^e: ).*$file_rel" "$BUILD_LOG" 2>/dev/null | head -n1)"
-    if printf "%s" "$m" | grep -qi "error:"; then
-      msg_core="$(printf "%s" "$m" | sed -E 's/.*[Ee]rror:[[:space:]]*//')"
-    else
-      msg_core="$(printf "%s" "$m" | sed -E "s#^.*$file_rel(:[0-9]+(:[0-9]+)?)?:[[:space:]]*##")"
-    fi
-    local esc; esc="$(printf "%s" "$m" | sed 's/[.[\*^$()+?{}|/\\]/\\&/g')"
-    ctx="$(awk -v pat="$esc" 'f==0 && index($0,pat)>0 {f=1; next} f>0 && n<2 {print; n++}' "$BUILD_LOG" 2>/dev/null)"
-    printf "%s\n%s" "$msg_core" "$ctx" | sed 's/\r$//'
-  }
 
   printed=false
-  seen_keys=""  # برای دِدیوپ
+  seen=""     # de-dup across all blocks
+  seen_msg="" # de-dup for message-only blocks
 
-  # الف) چاپ بلاک‌های file:line فقط برای فایل‌های واقعی پروژه
+  # (A) file:line refs → فقط فایل‌هایی که واقعاً در پروژه وجود دارند
+  refs="$PACK_DIR/.refs"
+  grep -Eo "([./][^ :\"']+|/[^ :\"']+)\.(kts|kt|java|xml|gradle|pro):[0-9]+" "$LOG" 2>/dev/null \
+    | sed -E "s#^$PWD/##" | awk '!seen[$0]++' > "$refs" || true
+
   if [ -s "$refs" ]; then
     while IFS= read -r ref; do
-      [ -z "$ref" ] && continue
-      file="${ref%:*}"; line="${ref##*:}"
-      file_rel="$(relpath "$file")"
-      [ -f "$file" ] || file="./$file_rel"
-
-      msg="$(extract_message_with_context "$file_rel" "$line")"
-      msg_first="$(printf "%s" "$msg" | head -n1)"
-
-      key="F|$file_rel|$line|$msg_first"
-      case ",$seen_keys," in
-        *",$key,"*) continue ;;
-      esac
-      seen_keys="$seen_keys,$key"
-
-      start=$(( line>20 ? line-20 : 1 ))
-      end=$(( line+20 ))
-      code="$(awk -v s="$start" -v e="$end" 'NR>=s && NR<=e {print}' "$file" 2>/dev/null)"
-
+      file="${ref%:*}"; line="${ref##*:}"; relf="$(rel "$file")"
+      [ -f "$file" ] || file="./$relf"; [ -f "$file" ] || continue
+      m="$(grep -n -E "($relf(:$line)?)([^[:alnum:]]|$)" "$LOG" | head -n1 | sed -E 's/^[0-9]+://')"
+      [ -z "$m" ] && m="$(grep -E "(^|[[:space:]])e: .*$relf" "$LOG" | head -n1)"
+      msg="$(printf "%s\n" "$m" | clean_firstmsg)"
+      key="F|$relf|$line|$msg"; case ",$seen," in *",$key,"*) continue;; esac; seen="$seen,$key"
       {
-        printf "Error in: %s\n" "$file_rel"
+        printf "Error in: %s\n" "$relf"
         printf "Message: %s\n" "$msg"
-        printf "Code:\n%s\n" "$code"
-        printf "Full Content:\n"
-        cat "$file" 2>/dev/null || true
-        printf "\n---\n"
+        printf "Code:\n"; snippet "$file" "$line"
+        printf "Full Content:\n"; cat "$file" 2>/dev/null || true; printf "\n---\n"
       } >> "$OUT_ERRORS"
-
       printed=true
     done < "$refs"
   fi
 
-  # ب) بلاک‌های Task (بدون file:line) — فشرده و یکتا، بدون استک‌تریس
-  #   واژه‌های ممنوعهٔ استک‌تریس را حذف می‌کنیم تا تکرارها نیاید
-  local task_blocks="$PACK_DIR/.task.blocks"
-  awk '
-    /^> Task / { if (cur!="") print cur; cur=$0; next }
-    { cur=cur ORS $0 }
-    END{ if (cur!="") print cur }
-  ' "$BUILD_LOG" > "$task_blocks" 2>/dev/null || true
-
-  if [ -s "$task_blocks" ]; then
-    while IFS= read -r -d '' block; do
-      title="$(printf "%s" "$block" | sed -n '1p')"
-      msgs="$(printf "%s" "$block" \
-        | grep -E "error:|^e: |Element type |is missing|not found|duplicate|Cannot find|Could not |FAILURE:" \
-        | grep -Ev "\.gradle\.|\.internal\.|\.xerces\.|\.DefaultBuildOperationRunner|\.Execute|\.java:[0-9]+" \
-        | sed -E 's/^[[:space:]]+//')"
-
-      [ -n "$msgs" ] || continue
-      first_msg="$(printf "%s" "$msgs" | head -n1)"
-
-      key="T|$title|$first_msg"
-      case ",$seen_keys," in
-        *",$key,"*) continue ;;
-      esac
-      seen_keys="$seen_keys,$key"
-
-      # تلاش برای Manifest
-      mani_path="$(printf "%s" "$block" | grep -Eo "([./][^ :'\"]+|/[^ :'\"]+)/AndroidManifest\.xml" | head -n1)"
-      [ -n "$mani_path" ] || mani_path="$(find . -name AndroidManifest.xml | head -n1 || true)"
-      snip=""
-      if [ -f "$mani_path" ]; then
-        lnno="$(nl -ba "$mani_path" | grep -n "<action" 2>/dev/null | head -n1 | cut -d: -f1)"
-        if [ -n "$lnno" ]; then
-          a=$(( lnno>20 ? lnno-20 : 1 ))
-          b=$(( lnno+20 ))
-          snip="$(awk -v s="$a" -v e="$b" 'NR>=s && NR<=e {print}' "$mani_path" 2>/dev/null)"
-        fi
+  # (B) Kotlin 'e:' blocks (null-separated) → ممکن است بدون file:line باشند
+  eblocks="$PACK_DIR/.eblocks"
+  awk 'BEGIN{blk="";} /^e: /{ if (blk!=""){ printf "%s\0", blk; blk=$0; next } blk=$0; next } { if (blk!="") blk=blk ORS $0 } END{ if (blk!="") printf "%s\0", blk }' "$LOG" > "$eblocks" 2>/dev/null
+  if [ -s "$eblocks" ]; then
+    while IFS= read -r -d '' blk; do
+      fline="$(printf "%s" "$blk" | grep -Eo "([./][^ :\"']+|/[^ :\"']+)\.(kts|kt|java|xml)(:[0-9]+)?" | head -n1)"
+      file="${fline%:*}"; line="${fline##*:}"; [ "$file" = "$line" ] && line=""
+      relf=""; [ -n "$file" ] && relf="$(rel "$file")"
+      [ -n "$relf" ] && { [ -f "$file" ] || file="./$relf"; }
+      msg="$(printf "%s" "$blk" | sed -E 's/^e:[[:space:]]*//' | head -n3 | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')"
+      printf "%s" "$msg" | grep -qE "\.gradle\.|\.internal\.|\.xerces\." && continue
+      if [ -z "$relf" ]; then mkey="MSG|$(printf "%s" "$msg" | head -n1)"; case ",$seen_msg," in *",$mkey,"*) continue;; esac; seen_msg="$seen_msg,$mkey"; fi
+      key="E|${relf:-no-file}|$(printf "%s" "$msg" | head -n1)"; case ",$seen," in *",$key,"*) continue;; esac; seen="$seen,$key"
+      if [ -n "$relf" ] && [ -f "$file" ]; then
+        if printf "%s" "$line" | grep -q '^[0-9]\+$'; then code="$(snippet "$file" "$line")"; else code="$(sed -n '1,120p' "$file")"; fi
+        {
+          printf "Error in: %s\n" "$relf"
+          printf "Message: %s\n" "$msg"
+          printf "Code:\n%s\n" "$code"
+          printf "Full Content:\n"; cat "$file" 2>/dev/null || true; printf "\n---\n"
+        } >> "$OUT_ERRORS"
+      else
+        {
+          printf "Error in: (no file path)\n"
+          printf "Message: %s\n" "$msg"
+          printf "Code:\n\nFull Content:\n\n---\n"
+        } >> "$OUT_ERRORS"
       fi
-
-      {
-        printf "Error in: %s\n" "$( [ -n "$mani_path" ] && relpath "$mani_path" || echo "(no file path)" )"
-        printf "Message: %s\n" "$first_msg"
-        printf "Code:\n%s\n" "${snip:-}"
-        printf "Full Content:\n"
-        [ -f "$mani_path" ] && cat "$mani_path" || true
-        printf "\n---\n"
-      } >> "$OUT_ERRORS"
-
       printed=true
-    done < <(awk 'BEGIN{RS="";ORS="\0"}{print}' "$task_blocks")
+    done < "$eblocks"
   fi
 
-  # ج) اگر هیچ‌چیز چاپ نشد، خلاصهٔ عمومی
-  if ! $printed; then
-    {
-      echo "Error in: (no file path)"
-      grep -E "^(FAILURE:|\* What went wrong:|Caused by:|> Could not |Could not )" "$BUILD_LOG" 2>/dev/null | head -n 80
-      echo "Message: (see lines above)"
-      echo "Code:"
-      echo
-      echo "Full Content:"
-      echo
-      echo "---"
-    } >> "$OUT_ERRORS"
+  # (C) Task blocks (Manifest/KSP/etc.) — تلاش برای ضمیمه‌کردن AndroidManifest.xml + دِدیوپ پیام
+  taskblocks="$PACK_DIR/.task.blocks"
+  awk '/^> Task /{ if (cur!="") print cur "\n"; cur=$0; next } { cur=cur ORS $0 } END{ if (cur!="") print cur }' "$LOG" > "$taskblocks" 2>/dev/null
+  if [ -s "$taskblocks" ]; then
+    while IFS= read -r block; do
+      printf "%s" "$block" | grep -qEi "(error:|FAILURE:|Could not |process.*Manifest|AndroidManifest\.xml)" || continue
+      firstmsg="$(printf "%s" "$block" | grep -E "error:|Element type |not found|Could not |FAILURE:" | head -n1 | sed -E 's/^[[:space:]]+//')"
+      [ -n "$firstmsg" ] || firstmsg="$(printf "%s" "$block" | sed -n '1p')"
+      mkey="MSG|$firstmsg"; case ",$seen_msg," in *",$mkey,"*) continue;; esac; seen_msg="$seen_msg,$mkey"
+      key="T|$firstmsg"; case ",$seen," in *",$key,"*) continue;; esac; seen="$seen,$key"
+      mani="$(printf "%s" "$block" | grep -Eo "([./][^ :\"']+|/[^ :\"']+)/AndroidManifest\.xml" | head -n1)"
+      [ -z "$mani" ] && mani="$(find ./app -name AndroidManifest.xml | head -n1 || true)"
+      snip=""
+      if [ -n "$mani" ] && [ -f "$mani" ]; then
+        lnno="$(nl -ba "$mani" | grep -n "<action" | head -n1 | cut -d: -f1)"
+        if [ -n "$lnno" ]; then snip="$(snippet "$mani" "$lnno")"; else snip="$(sed -n '1,120p' "$mani")"; fi
+        {
+          printf "Error in: %s\n" "$(rel "$mani")"
+          printf "Message: %s\n" "$firstmsg"
+          printf "Code:\n%s\n" "$snip"
+          printf "Full Content:\n"; cat "$mani"; printf "\n---\n"
+        } >> "$OUT_ERRORS"
+      else
+        {
+          printf "Error in: (no file path)\n"
+          printf "Message: %s\n" "$firstmsg"
+          printf "Code:\n\nFull Content:\n\n---\n"
+        } >> "$OUT_ERRORS"
+      fi
+      printed=true
+    done < "$taskblocks"
   fi
 
-  echo "." >> "$OUT_ERRORS"
+  $printed || printf "No build errors.\n" >> "$OUT_ERRORS"
+  printf ".\n" >> "$OUT_ERRORS"
 }
 
-# -------------------- 3) R-Sync.txt --------------------
+# -------- 3) R-Sync.txt --------
 gen_sync() {
   : > "$OUT_SYNC"
-  local SYNC_LOG="$PACK_DIR/.sync.log"
-
+  local LOG="$PACK_DIR/.sync.log"
   if [ -x ./gradlew ]; then
-    ./gradlew --stacktrace --warning-mode=all tasks >"$SYNC_LOG" 2>&1 || true
-    # همه‌ی انواع ارورهای کانفیگ/دیپندنسی/پلاگین
-    if grep -qEi "FAILURE:|\* What went wrong:|Caused by:|Plugin [^ ]+ not found|Could not resolve|Version .* not found|Dependency .* not found|Invalid plugin|Problem occurred|error:" "$SYNC_LOG"; then
-      grep -Ei "^(FAILURE:|\* What went wrong:|Caused by:|Plugin [^ ]+ not found|Could not resolve|Version .* not found|Dependency .* not found|Invalid plugin|Problem occurred|error:)" "$SYNC_LOG" \
+    ./gradlew --stacktrace --warning-mode=all tasks >"$LOG" 2>&1 || true
+    if grep -qEi "FAILURE:|\* What went wrong:|Caused by:|Plugin [^ ]+ not found|Could not resolve|Version .* not found|Dependency .* not found|Invalid plugin|Problem occurred|error:" "$LOG"; then
+      grep -Ei "^(FAILURE:|\* What went wrong:|Caused by:|Plugin [^ ]+ not found|Could not resolve|Version .* not found|Dependency .* not found|Invalid plugin|Problem occurred|error:)" "$LOG" \
         | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//' \
         | awk '{print "Sync Error: "$0"\n---"}' >> "$OUT_SYNC"
     else
-      echo "No sync errors." >> "$OUT_SYNC"
-      echo "." >> "$OUT_SYNC"
+      printf "No sync errors.\n.\n" >> "$OUT_SYNC"
     fi
   else
-    echo "No sync errors." >> "$OUT_SYNC"
-    echo "." >> "$OUT_SYNC"
+    printf "No sync errors.\n.\n" >> "$OUT_SYNC"
   fi
 }
 
-# -------------------- 4) R-Root.txt --------------------
+# -------- 4) R-Root.txt (ABS_ROOT=1 → absolute) --------
 gen_tree() {
   : > "$OUT_TREE"
-  local tree_list="$PACK_DIR/.tree.files"; : > "$tree_list"
+  local list="$PACK_DIR/.tree.files"; : > "$list"
 
-  if [ -s "$targets_file" ]; then
+  # فقط فایل‌های kt/java/xml پروژه (پکیج یا کل src/*)
+  if [ -s "$targets" ]; then
     while IFS= read -r t; do
-      find "$t" -type f \( -name "*.kt" -o -name "*.java" -o -name "*.xml" \) 2>/dev/null
-    done < "$targets_file" >> "$tree_list"
+      find "$t" -type f \( -name '*.kt' -o -name '*.java' -o -name '*.xml' \) 2>/dev/null
+    done < "$targets" >> "$list"
   fi
-  if [ ! -s "$tree_list" ]; then
-    find . -path "*/src/*" -type f \( -name "*.kt" -o -name "*.java" -o -name "*.xml" \) 2>/dev/null >> "$tree_list"
-  fi
+  [ -s "$list" ] || find . -path "*/src/*" -type f \( -name '*.kt' -o -name '*.java' -o -name '*.xml' \) 2>/dev/null >> "$list"
 
-  if [ -s "$tree_list" ]; then
-    sort -u "$tree_list" | while IFS= read -r f; do
-      echo "$(relpath "$f")"
+  if [ -s "$list" ]; then
+    sort -u "$list" | while IFS= read -r f; do
+      if [ "${ABS_ROOT:-1}" = "1" ]; then
+        printf "%s\n" "$(abspath "$f")"
+      else
+        printf "%s\n" "$(rel "$f")"
+      fi
     done >> "$OUT_TREE"
   fi
 }
 
-# -------------------- Run all --------------------
+# -------- run --------
 gen_content
 gen_errors
 gen_sync
 gen_tree
 
-echo "Done. See ai-pack/:"
+echo "Done. Outputs in: $PACK_DIR/"
 ls -1 "$PACK_DIR" 2>/dev/null || true
