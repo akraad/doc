@@ -1,0 +1,35 @@
+#!/bin/bash
+# Build & capture log
+./gradlew build --stacktrace --warning-mode=all > build.log 2>&1 || true
+
+# Extract file:line + error message
+grep -Eo "([./][^ :'\"]+|/[^ :'\"]+)\.(kt|kts|java|xml):[0-9]+[^']*" build.log \
+  | sed -E "s#^$PWD/##" \
+  | sort -u \
+  | while IFS=: read -r file line rest; do
+      if [ -f "$file" ]; then
+        # شروع بلاک
+        start=$(awk -v L=$line 'NR<=L{ if($0 ~ /\{/) s=NR } END{print s+0}' "$file")
+        [ -z "$start" ] && start=$line
+
+        # پایان بلاک (پیدا کردن } متوازن)
+        end=$(awk -v L=$line '
+          NR<L {next}
+          {
+            for(i=1;i<=length($0);i++){
+              c=substr($0,i,1)
+              if(c=="{") depth++
+              if(c=="}"){depth--; if(depth<=0){print NR; exit}}
+            }
+          }' "$file")
+        [ -z "$end" ] && end=$line
+
+        # پیام خطا
+        errmsg=$(grep -m1 "$file:$line" build.log | sed -E "s#^.*$file:$line:? ##")
+
+        echo ">>> $file:$line"
+        echo "Error: $errmsg"
+        sed -n "${start},${end}p" "$file"
+        echo "---"
+      fi
+    done > MyAppErrors.txt
