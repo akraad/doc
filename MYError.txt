@@ -1,184 +1,106 @@
 #!/usr/bin/env bash
-# MyCrash.sh — Runtime crash catcher (macOS-safe, BSD awk compatible)
+# Reliable Android/Kotlin error reporter → MyAppErrors.txt (macOS bash/zsh)
 
 set +e
-OUT="${OUT:-Crash-Report.txt}"
-TIMEOUT="${TIMEOUT:-120}"
-MONITOR=0
-PKG=""
+OUT="MyAppErrors.txt"; : > "$OUT"
+BUILD_LOG=".my_build.log"; : > "$BUILD_LOG"
+SYNC_LOG=".my_sync.log";  : > "$SYNC_LOG"
 
-# Args: --package com.example.app  --timeout 180  --out file  --monitor
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --out) OUT="$2"; shift 2;;
-    --timeout) TIMEOUT="$2"; shift 2;;
-    --monitor) MONITOR=1; shift;;
-    --package) PKG="$2"; shift 2;;
-    *) shift;;
-  esac
-done
+TIMEOUT_SECS="${TIMEOUT_SECS:-120}"
+GRADLE_ARGS="--no-daemon --console=plain --max-workers=1 --stacktrace --warning-mode=all"
 
-die(){ echo "ERROR: $*" >&2; exit 1; }
-rel(){ p="$1"; case "$p" in /*) p="${p#"$PWD/"}";; esac; echo "${p#./}"; }
-esc_sed(){ printf '%s' "$1" | sed 's/[][(){}.^$+*?|\\/]/\\&/g'; }
+rel(){ local p="$1"; case "$p" in /*) p="${p#"$PWD/"}";; esac; printf "%s" "${p#./}"; }
+esc(){ printf '%s' "$1" | sed 's/[][(){}.^$+*?|\\/]/\\&/g'; }
 
-# Try to auto-detect applicationId if not provided
-if [ -z "$PKG" ]; then
-  PKG="$(grep -Rho --include='build.gradle' --include='build.gradle.kts' "applicationId[[:space:]]\+['\"][^'\"]\+['\"]" . 2>/dev/null | head -n1 | sed -E 's/.*["'\'']([^"'\'']+)["'\''].*/\1/')" || true
-fi
+clean_err(){ sed -E 's/^.*:[0-9]+(:[0-9]+)?[: ]*//; s/^.*:\([0-9]+,[0-9]+\)[: ]*//; s/^[[:space:]]+//; s/[[:space:]]+$//; s/^[ew]:[[:space:]]*//' ; }
+clean_warn(){ sed -E 's/^.*:[0-9]+(:[0-9]+)?[: ]*//; s/^.*:\([0-9]+,[0-9]+\)[: ]*//; s/^[[:space:]]+//; s/[[:space:]]+$//; s/^w:[[:space:]]*//' ; }
 
-if [ -z "$PKG" ]; then
-  echo "Note: --package not provided and applicationId not found. Will catch ANY process crashes."
-fi
+code_block(){ # <file> <line> → enclosing { ... } (best-effort)
+  local f="$1" l="$2" s e
+  [ -f "$f" ] || return 0
+  s=$(awk -v L="$l" 'NR<=L{ if(index($0,"{")) S=NR } END{print S+0}' "$f")
+  [ -z "$s" ] || [ "$s" = 0 ] && s="$l"
+  e=$(awk -v L="$l" 'NR<L{next}{for(i=1;i<=length($0);i++){c=substr($0,i,1); if(c=="{")d++; if(c=="}"){d--; if(d<=0){print NR; exit}}}}' "$f")
+  [ -z "$e" ] && e="$l"
+  sed -n "${s},${e}p" "$f"
+}
 
-command -v adb >/dev/null 2>&1 || die "adb not found in PATH"
-adb get-state >/dev/null 2>&1 || die "No device/emulator detected"
+run_with_timeout(){ # usage: run_with_timeout <secs> <gradle args...>
+  local secs="$1"; shift
+  ( ./gradlew "$@" $GRADLE_ARGS >>"$BUILD_LOG" 2>&1 ) & local GPID=$!
+  ( sleep "$secs"; kill -0 $GPID 2>/dev/null && echo "[TIMEOUT] killed after ${secs}s" >>"$BUILD_LOG" && kill -9 $GPID 2>/dev/null ) & local TPID=$!
+  wait $GPID 2>/dev/null; kill -9 $TPID 2>/dev/null || true
+}
 
-MODEL="$(adb shell getprop ro.product.model | tr -d '\r')"
-SDK="$(adb shell getprop ro.build.version.sdk | tr -d '\r')"
-ANDROID="$(adb shell getprop ro.build.version.release | tr -d '\r')"
-
-adb logcat -c >/dev/null 2>&1
-
-# Prefer gtimeout (coreutils) if available; fallback to timeout; else none
-if [ "$MONITOR" -eq 0 ]; then
-  if command -v gtimeout >/dev/null 2>&1; then TO=(gtimeout "$TIMEOUT")
-  elif command -v timeout  >/dev/null 2>&1; then TO=(timeout "$TIMEOUT")
-  else TO=() ; fi
+# ---------------- 1) Sync/config quick scan ----------------
+./gradlew tasks $GRADLE_ARGS >"$SYNC_LOG" 2>&1 || true
+if grep -qEi "FAILURE:|\* What went wrong:|Caused by:|Plugin [^ ]+ not found|Could not resolve|Dependency .* not found|Invalid plugin" "$SYNC_LOG"; then
+  grep -Ei "^(FAILURE:|\* What went wrong:|Caused by:|Plugin [^ ]+ not found|Could not resolve|Dependency .* not found|Invalid plugin)" "$SYNC_LOG" \
+    | awk '{print "[SYNC] "$0"\n---"}' >> "$OUT"
 else
-  TO=()
+  echo "[SYNC] No sync errors." >> "$OUT"; echo "---" >> "$OUT"
 fi
 
-# Escape pattern for awk match
-PKGRE="$(esc_sed "$PKG")"
+# ---------------- 2) Compile (real, fast) ----------------
+# اول تلاش می‌کنیم فقط Kotlinِ app را کامپایل کنیم؛ اگر app نبود یا نشد، به build می‌رویم
+run_with_timeout "$TIMEOUT_SECS" :app:compileDebugKotlin -x test -x lint
+# اگر چیزی توی لاگ خطا نرفت، دوباره compileDebugKotlin عمومی:
+grep -qE "e: | error: |FAILURE:" "$BUILD_LOG" || run_with_timeout "$TIMEOUT_SECS" compileDebugKotlin -x test -x lint
+# در نهایت fallback:
+grep -qE "e: | error: |FAILURE:" "$BUILD_LOG" || run_with_timeout "$TIMEOUT_SECS" build -x test -x lint
 
-# Run logcat and parse with BSD awk-safe script (no C-style comments)
-"${TO[@]}" adb logcat -v threadtime *:V | awk -v out="$OUT" -v pkg="$PKG" -v pkgre="$PKGRE" -v monitor="$MONITOR" -v model="$MODEL" -v sdk="$SDK" -v android="$ANDROID" '
-BEGIN{
-  N=200; head=0; fill=0; sep="---";
-  firstCrash=1;
-  print "" > out; close(out);
-}
-function push(line){ buf[head]=line; head=(head+1)%N; if(fill<N) fill++; }
-function dump_context(outf){
-  print "=== Context (last ~200 lines) ===" >> outf;
-  for(i=head-fill;i<head;i++){ idx=(i+N)%N; print buf[idx] >> outf; }
-}
-function write_header(outf, kind, title){
-  print "Device: " model " | Android " android " (SDK " sdk ")" >> outf;
-  if(pkg!="") print "Package: " pkg >> outf;
-  print "Type: " kind >> outf;
-  print "Title: " title >> outf;
-  print sep >> outf;
-}
-function top_app_frames(stack,   i, line, outl, cnt){
-  cnt=0; split(stack, arr, "\n");
-  for(i=1;i<=length(arr);i++){
-    line=arr[i];
-    if(pkg=="" || line ~ pkgre){
-      if(line ~ /^ *at /){
-        outl=outl line "\n"; cnt++;
-        if(cnt>=6) break;
-      }
-    }
-  }
-  if(cnt==0) return "(no app frames)\n";
-  return outl;
-}
-function handle_java(outf){
-  write_header(outf, "Java FATAL EXCEPTION", fatalTitle);
-  if(threadLine!="") print "Thread: " threadLine >> outf;
-  print sep >> outf;
-  print "Exception:" >> outf;
-  print fatalTitle >> outf;
-  if(causedBy!="") print causedBy >> outf;
-  print sep >> outf;
-  print "Top app frames:" >> outf;
-  print top_app_frames(stackBlock) >> outf;
-  print sep >> outf;
-  dump_context(outf);
-  print "" >> outf; print "" >> outf;
-}
-function handle_native(outf){
-  write_header(outf, "Native Crash", nativeTitle);
-  print sep >> outf;
-  print "Backtrace (excerpt):" >> outf;
-  print nativeTrace >> outf;
-  print sep >> outf;
-  dump_context(outf);
-  print "" >> outf; print "" >> outf;
-}
-function handle_anr(outf){
-  write_header(outf, "ANR", anrTitle);
-  print sep >> outf;
-  print "Details:" >> outf;
-  print anrBlock >> outf;
-  print sep >> outf;
-  dump_context(outf);
-  print "" >> outf; print "" >> outf;
+# ---------------- 3) Parse build ERRORS ----------------
+# الگوهای file:line هم برای ":42" هم برای ":(42,5)"
+tmpE=".refs.err"; : > "$tmpE"
+grep -Eo '([./][^ :")]+|/[^ :")]+)\.(kt|kts|java|xml): ?(\([0-9]+|[0-9]+)' "$BUILD_LOG" \
+  | sed -E "s#^$PWD/##" \
+  | sed -E -e 's/: *\(([0-9]+).*/:\1/' -e 's/: *([0-9]+).*/:\1/' \
+  | sort -u > "$tmpE"
+
+get_msg(){ # <file> <line> → message (handles both ":42" and ":(42,5)")
+  local f="$1" l="$2" ef; ef="$(esc "$f")"
+  local m
+  m="$(grep -m1 -E "$ef:[[:space:]]*\\($l," "$BUILD_LOG" | sed -E "s#.*$ef:[[:space:]]*\\($l,[0-9]+\\):[[:space:]]*##" | clean_err)"
+  [ -n "$m" ] || m="$(grep -m1 -E "$ef:$l(:[0-9]+)?[: ]" "$BUILD_LOG" | sed -E "s#.*$ef:$l(:[0-9]+)?[: ]*##" | clean_err)"
+  [ -n "$m" ] || m="$(grep -m1 -E "e: .*${ef}.*" "$BUILD_LOG" | clean_err)"
+  printf "%s" "$m"
 }
 
-{
-  line=$0;
-  push(line);
+if [ -s "$tmpE" ]; then
+  while IFS=: read -r file line; do
+    [ -f "$file" ] || continue
+    msg="$(get_msg "$file" "$line")"
+    printf "%s:%s | ERROR | %s\n" "$(rel "$file")" "$line" "$msg" >> "$OUT"
+    code_block "$file" "$line" >> "$OUT"
+    echo "---" >> "$OUT"
+  done < "$tmpE"
+else
+  echo "[BUILD] No build errors." >> "$OUT"; echo "---" >> "$OUT"
+fi
 
-  # Java/Kotlin fatal exception
-  if(index(line,"FATAL EXCEPTION:")>0){
-    fatalTitle=line; threadLine=""; causedBy=""; stackBlock="";
-    while( (getline l) > 0 ){
-      push(l);
-      if(l ~ /^$/) break;
-      if(pkg!="" && l ~ /Process:/ && l !~ pkgre) { }  # ignore other processes only when pkg is set
-      if(l ~ /^ *at / || index(l,"Caused by:")==1 || index(l,"Exception")>0 ){
-        stackBlock = stackBlock l "\n";
-        if(index(l,"Caused by:")==1 && causedBy==""){ causedBy=l }
-      }
-      if(l ~ /" (main|[^"]+)"/ || l ~ /pid=/ ){ threadLine=l }
-      fatalTitle = fatalTitle "\n" l
-    }
-    if(pkg=="" || fatalTitle ~ pkgre || stackBlock ~ pkgre){
-      handle_java(out);
-      if(!monitor) exit;
-    }
-  }
+# ---------------- 4) Parse WARNINGS ----------------
+tmpW=".refs.warn"; : > "$tmpW"
+grep -Eo 'w:[[:space:]]+[./][^ :")]+\.(kt|kts|java|xml): ?[0-9]+|([./][^ :")]+|/[^ :")]+)\.(kt|kts|java|xml): ?[0-9]+: [Ww]arning:' "$BUILD_LOG" \
+  | sed -E 's/^[[:space:]]*w:[[:space:]]*//' \
+  | sed -E 's/: [Ww]arning:.*$/:/' \
+  | sed -E "s#^$PWD/##" | sed -E 's/[:]+$//' | sort -u > "$tmpW"
 
-  # Native crash (tombstoned/backtrace/fatal signal)
-  if(line ~ /(Fatal signal|backtrace:|tombstoned:)/){
-    nativeTitle=line;
-    nativeTrace=line "\n";
-    for(i=0;i<80;i++){
-      if( (getline l2) <= 0 ) break;
-      push(l2);
-      nativeTrace = nativeTrace l2 "\n";
-      if(l2 ~ /backtrace ends|--------- beginning of/) break;
-    }
-    if(pkg=="" || nativeTrace ~ pkgre){
-      handle_native(out);
-      if(!monitor) exit;
-    }
-  }
+if [ -s "$tmpW" ]; then
+  while IFS=: read -r file line; do
+    [ -f "$file" ] || continue
+    wmsg="$(grep -m1 -E "(^|[[:space:]])(w: )?$(esc "$file"):[[:space:]]*$line(,|:| )" "$BUILD_LOG" | clean_warn)"
+    [ -n "$wmsg" ] || wmsg="$(grep -m1 -E "(^|[[:space:]])(w: )?$(esc "$file"):$line" "$BUILD_LOG" | clean_warn)"
+    code="$(sed -n "${line}p" "$file")"
+    printf "%s:%s | WARNING | %s\n%s\n---\n" "$(rel "$file")" "$line" "$wmsg" "$code" >> "$OUT"
+  done < "$tmpW"
+else
+  echo "[WARN] No warnings." >> "$OUT"; echo "---" >> "$OUT"
+fi
 
-  # ANR block
-  if(index(line,"ANR in ")==1){
-    if(pkg!="" && line !~ ("ANR in " pkgre)) { next }
-    anrTitle=line; anrBlock=line "\n";
-    for(i=0;i<120;i++){
-      if( (getline l3) <= 0 ) break;
-      push(l3);
-      anrBlock = anrBlock l3 "\n";
-      if(l3 ~ /^$/) break;
-    }
-    handle_anr(out);
-    if(!monitor) exit;
-  }
-}
-END{
-  if(monitor==0){
-    if(system("[ -s " out " ]")!=0){
-      print "No runtime crash captured within timeout." > out
-    }
-  }
-}
-'
-
-echo "Report → $(rel "$OUT")"
+# ---------------- 5) Non-file (KSP/Exceptions/etc.) ----------------
+if grep -qE "(Internal compiler error|java\.lang\.[A-Za-z]+Exception|ksp|KSP|Manifest merger failed|Storage for .*/kspCaches)" "$BUILD_LOG"; then
+  grep -E "(Internal compiler error|java\.lang\.[A-Za-z]+Exception|ksp|KSP|Manifest merger failed|Storage for .*/kspCaches)" "$BUILD_LOG" \
+    | awk '!seen[$0]++{print "(no file) | ERROR | "$0"\n---"}' >> "$OUT"
+else
+  echo "[NONFILE] No internal/KSP errors." >> "$OUT"; echo "---" >> "$OUT"
+fi
