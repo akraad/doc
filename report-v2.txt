@@ -1,0 +1,198 @@
+#!/usr/bin/env zsh
+# unified-report.sh — macOS zsh
+# Creates ./report/{content.txt, root.txt, error.txt}
+# - content.txt: all .kt/.kts + gradle.properties + gradle/libs.versions.toml (excluding app/build/)
+# - root.txt   : list files under app/, excluding any path containing /res/ and excluding app/build/
+# - error.txt  : minimal BUILD/SYNC/LOGCAT errors + CODE CONTEXTS (±25)
+
+set -euo pipefail
+emulate -L zsh
+setopt NULL_GLOB
+
+ROOT="$(pwd)"
+OUT_DIR="$ROOT/report"
+TMP_DIR="$OUT_DIR/.tmp"
+mkdir -p "$OUT_DIR" "$TMP_DIR"
+
+CONTENT_OUT="$OUT_DIR/content.txt"
+ROOT_OUT="$OUT_DIR/root.txt"
+ERROR_OUT="$OUT_DIR/error.txt"
+
+: > "$CONTENT_OUT"
+: > "$ROOT_OUT"
+: > "$ERROR_OUT"
+
+# ---------- helpers ----------
+relpath() {
+  [[ "$1" == "$ROOT"* ]] && print -r -- "${1#$ROOT/}" || print -r -- "$1"
+}
+
+# ========== CONTENT (fixed) ==========
+build_content() {
+  local LIST="$TMP_DIR/content_list.txt"
+  : > "$LIST"
+
+  # 1) همه‌ی .kt/.kts (غیر از app/build)
+  find "$ROOT" \
+    -path "$ROOT/app/build" -prune -o \
+    -type f \( -name '*.kt' -o -name '*.kts' \) -print 2>/dev/null \
+    | sed "s|^$ROOT/||" >> "$LIST"
+
+  # 2) gradle.properties
+  [[ -f "$ROOT/gradle.properties" ]] && echo "gradle.properties" >> "$LIST"
+
+  # 3) gradle/libs.versions.toml
+  [[ -f "$ROOT/gradle/libs.versions.toml" ]] && echo "gradle/libs.versions.toml" >> "$LIST"
+
+  # مرتب‌سازی پایدار و لکسی‌گرافیک
+  LC_ALL=C sort -u "$LIST" -o "$LIST"
+
+  # چاپ طبق فرمت خواسته‌شده
+  while IFS= read -r rel; do
+    [[ -z "$rel" ]] && continue
+    local abs="$ROOT/$rel"
+    [[ -f "$abs" ]] || continue
+    printf 'PATH: %s\n' "$rel" >> "$CONTENT_OUT"
+    cat "$abs" >> "$CONTENT_OUT"
+    printf '\n' >> "$CONTENT_OUT"
+  done < "$LIST"
+}
+
+# ========== ROOT (unchanged) ==========
+build_root() {
+  local APP_DIR="$ROOT/app"
+  [[ -d "$APP_DIR" ]] || return 0
+
+  find "$APP_DIR" -type d -print0 2>/dev/null \
+    | while IFS= read -r -d '' dir; do
+        local rel="$(relpath "$dir")"
+        [[ "$rel" == *"/res/"* || "$rel" == "app/res" || "$rel" == */res ]] && continue
+        [[ "$rel" == "app/build" || "$rel" == app/build/* || "$rel" == */app/build/* ]] && continue
+
+        print -r -- "${rel}:" >> "$ROOT_OUT"
+        find "$dir" -maxdepth 1 -type f -print0 2>/dev/null \
+          | xargs -0 -I {} bash -c 'basename "$0"' {} \
+          | LC_ALL=C sort \
+          | while IFS= read -r name; do
+              print -r -- "  $name" >> "$ROOT_OUT"
+            done
+        print -r -- "" >> "$ROOT_OUT"
+      done
+}
+
+# ========== ERROR (minimal; unchanged from your latest) ==========
+build_error_minimal() {
+  local CTX=25
+  local LOGCAT_MAX=5000
+  local BUILD_LOG="$TMP_DIR/build_full.txt"
+  : > "$BUILD_LOG"
+
+  pick_build_task() {
+    if [[ -d "$ROOT/app" ]]; then echo ":app:assembleDebug"; return; fi
+    local cand mod
+    cand="$(find "$ROOT" -type f -path '*/src/main/AndroidManifest.xml' | head -n1 || true)"
+    if [[ -n "$cand" ]]; then
+      mod="${cand%/src/main/AndroidManifest.xml}"
+      mod="${mod#$ROOT/}"
+      echo ":${mod}:assembleDebug"; return
+    fi
+    echo "assembleDebug"
+  }
+  get_latest_idea_log() {
+    local list
+    list="$(find "$HOME/Library/Logs" -type f -name 'idea.log' -path '*/AndroidStudio*' -print0 \
+      | xargs -0 stat -f '%m %N' 2>/dev/null | sort -rn)"
+    [[ -z "$list" ]] && { echo ""; return; }
+    echo "$list" | awk 'NR==1{ $1=""; sub(/^ /,""); print }'
+  }
+  resolve_project_file() {
+    local rel="$1"
+    [[ -f "$ROOT/$rel" ]] && { echo "$ROOT/$rel"; return; }
+    [[ -f "$rel" ]] && { echo "$rel"; return; }
+    local base="$(basename "$rel")"
+    find "$ROOT" -type f -name "$base" 2>/dev/null | head -n1 || echo ""
+  }
+  print_context_block() {
+    local file="$1" line="$2"
+    [[ -f "$file" ]] || { echo "(file not found)"; return; }
+    local total start end
+    total=$(wc -l < "$file" | tr -d ' ')
+    start=$(( line - 25 )); (( start < 1 )) && start=1
+    end=$(( line + 25 ));   (( end > total )) && end=$total
+    nl -ba "$file" | sed -n "${start},${end}p"
+  }
+  extract_refs() {
+    grep -Eo '[A-Za-z0-9_./-]+\.(kt|kts|java|gradle|xml):[0-9]+' "$1" 2>/dev/null | LC_ALL=C sort -u
+  }
+
+  echo "==== BUILD ERRORS ====" >> "$ERROR_OUT"
+  if [[ -x "$ROOT/gradlew" ]]; then
+    local TASK; TASK="$(pick_build_task)"
+    "$ROOT/gradlew" "$TASK" --stacktrace 2>&1 | tee "$BUILD_LOG" || true
+  fi
+  if [[ -s "$BUILD_LOG" ]]; then
+    awk '
+      /^\* What went wrong:/ {print; c=0; next}
+      c<30 && NF {print; c++}
+      /^FAILURE: Build failed with an exception/ {print}
+      /Caused by:/ {print}
+      / error: / {print}
+      /^\s*e:\s/ {print}
+    ' "$BUILD_LOG" | LC_ALL=C sort -u >> "$ERROR_OUT"
+  fi
+  echo "" >> "$ERROR_OUT"
+
+  echo "==== SYNC ERRORS ====" >> "$ERROR_OUT"
+  local IDEA_LOG; IDEA_LOG="$(get_latest_idea_log)"
+  local SYNC_BUF="$TMP_DIR/sync_filtered.txt"; : > "$SYNC_BUF"
+  if [[ -n "$IDEA_LOG" && -f "$IDEA_LOG" ]]; then
+    awk '/Gradle|gradle|Sync|sync/ && /ERROR|Error|FAIL|Failure|Exception/ {print}' "$IDEA_LOG" \
+      | LC_ALL=C sort -u > "$SYNC_BUF" || true
+    if [[ -s "$SYNC_BUF" ]]; then
+      cat "$SYNC_BUF" >> "$ERROR_OUT"
+    else
+      echo "[tail of idea.log — last 200 lines]" >> "$ERROR_OUT"
+      tail -n 200 "$IDEA_LOG" >> "$ERROR_OUT" || true
+    fi
+  else
+    echo "(no idea.log found)" >> "$ERROR_OUT"
+  fi
+  echo "" >> "$ERROR_OUT"
+
+  echo "==== LOGCAT ERRORS ====" >> "$ERROR_OUT"
+  if command -v adb >/dev/null 2>&1; then
+    adb logcat -d 2>/dev/null | grep -E " E/| FATAL |Exception| ANR " \
+      | tail -n 5000 | LC_ALL=C sort -u >> "$ERROR_OUT" || true
+  else
+    echo "(adb not available)" >> "$ERROR_OUT"
+  fi
+  echo "" >> "$ERROR_OUT"
+
+  echo "==== CODE CONTEXTS (±25) ====" >> "$ERROR_OUT"
+  local REFS="$TMP_DIR/refs.txt"; : > "$REFS"
+  extract_refs "$ERROR_OUT" > "$REFS"
+  if [[ -s "$REFS" ]]; then
+    while IFS= read -r ref; do
+      local file_rel="${ref%:*}"
+      local line="${ref##*:}"
+      local abs; abs="$(resolve_project_file "$file_rel")"
+      echo "FILE: $file_rel  LINE: $line" >> "$ERROR_OUT"
+      if [[ -n "$abs" && -f "$abs" ]]; then
+        print_context_block "$abs" "$line" >> "$ERROR_OUT"
+      else
+        echo "(file not found)" >> "$ERROR_OUT"
+      fi
+      echo "" >> "$ERROR_OUT"
+    done < "$REFS"
+  fi
+}
+
+# ---------- run ----------
+build_content
+build_root
+build_error_minimal
+
+echo "Report generated in: $OUT_DIR"
+echo " - content.txt"
+echo " - root.txt"
+echo " - error.txt"
