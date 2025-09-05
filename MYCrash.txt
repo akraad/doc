@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# smart-crash-full.sh — Live, full crash report (Java/Kotlin/Native/ANR)
+# Output (default): Crash-Report.txt
+
+set +e
+OUT="${OUT:-Crash-Report.txt}"
+TIMEOUT="${TIMEOUT:-180}"  # seconds
+TMP_STREAM=".crash.stream"
+TMP_LAST=".crash.last"
+TMP_CTX=".crash.ctx"
+
+: > "$OUT"
+: > "$TMP_STREAM"
+: > "$TMP_LAST"
+: > "$TMP_CTX"
+
+die(){ echo "ERROR: $*" >&2; exit 1; }
+rel(){ p="$1"; case "$p" in /*) p="${p#"$PWD/"}";; esac; echo "${p#./}"; }
+esc_sed(){ printf '%s' "$1" | sed 's/[][(){}.^$+*?|\\/]/\\&/g'; }
+
+command -v adb >/dev/null 2>&1 || die "adb not found (install platform-tools)."
+adb get-state >/dev/null 2>&1 || die "No device/emulator detected."
+
+# Device info
+MODEL="$(adb shell getprop ro.product.model | tr -d '\r')"
+SDK="$(adb shell getprop ro.build.version.sdk | tr -d '\r')"
+ANDROID="$(adb shell getprop ro.build.version.release | tr -d '\r')"
+
+# Start fresh logs
+adb logcat -c >/dev/null 2>&1
+
+# Live streams: crash + main (برخی ROMها فقط main را می‌نویسند)
+( adb logcat -v threadtime -b crash *:V 2>/dev/null | tee -a "$TMP_STREAM" >/dev/null ) & PID_CRASH=$!
+( adb logcat -v threadtime -b main  *:V 2>/dev/null | tee -a "$TMP_STREAM" >/dev/null ) & PID_MAIN=$!
+
+echo "Waiting up to ${TIMEOUT}s for a crash... (run the app and reproduce)"
+
+start=$SECONDS
+found=0
+while : ; do
+  if grep -qE "FATAL EXCEPTION|Fatal signal|E AndroidRuntime: +FATAL|ANR in" "$TMP_STREAM"; then
+    found=1; break
+  fi
+  (( SECONDS - start >= TIMEOUT )) && break
+  sleep 0.5
+done
+
+# stop streams
+kill $PID_CRASH $PID_MAIN >/dev/null 2>&1 || true
+
+if [ "$found" -ne 1 ]; then
+  echo "No runtime crash captured within timeout." > "$OUT"
+  echo "Report → $(rel "$OUT")"
+  exit 0
+fi
+
+# Extract last crash block from combined stream
+awk '
+  BEGIN{blk=""; have=0}
+  /FATAL EXCEPTION|Fatal signal|E AndroidRuntime: +FATAL|ANR in/ {
+    if(have){last=blk}
+    blk=$0 ORS; have=1; next
+  }
+  { if(have) blk=blk $0 ORS }
+  END{
+    if(have){last=blk}
+    print last
+  }
+' "$TMP_STREAM" > "$TMP_LAST"
+
+# Grab recent context (last ~200 lines) from main log
+adb logcat -d -v threadtime -t 200 > "$TMP_CTX" 2>/dev/null || true
+
+# Parse crash block
+TYPE=""
+TITLE="$(sed -n '1p' "$TMP_LAST")"
+echo "$TITLE" | grep -q "FATAL EXCEPTION" && TYPE="Java FATAL EXCEPTION"
+echo "$TITLE" | grep -q "Fatal signal"     && TYPE="${TYPE:-Native Crash}"
+echo "$TITLE" | grep -q "ANR in"           && TYPE="${TYPE:-ANR}"
+
+PKG="$(grep -m1 -E 'Process:[[:space:]]+[^ ,]+' "$TMP_LAST" | awk '{print $2}')"
+[ -z "$PKG" ] && PKG="$(grep -m1 -E 'Cmdline:[[:space:]]+[^ ]+' "$TMP_LAST" | awk '{print $2}')"
+[ -z "$PKG" ] && PKG="$(grep -m1 -E 'ANR in[[:space:]]+[^ ]+' "$TMP_LAST" | awk '{print $3}')"
+
+# Exception summary & caused by
+EX_SUMMARY="$(grep -m1 -E 'E AndroidRuntime: (java|kotlin)\.|E AndroidRuntime: [A-Za-z]+Exception:' "$TMP_LAST" | sed -E 's/^.*E AndroidRuntime: //')"
+[ -z "$EX_SUMMARY" ] && EX_SUMMARY="$(grep -m1 -E 'FATAL EXCEPTION' "$TMP_LAST" | sed -E 's/^.*FATAL EXCEPTION: *//')"
+CAUSED="$(grep -m1 -E 'Caused by:' "$TMP_LAST" | sed -E 's/^.*Caused by: *//')"
+
+# Full stack (limit size)
+FULL_STACK=""
+if [ "$TYPE" = "Java FATAL EXCEPTION" ]; then
+  FULL_STACK="$(awk '/E AndroidRuntime:/{print substr($0,index($0,$3))}' "$TMP_LAST" | sed -E 's/^E AndroidRuntime: *//')"
+  [ -z "$FULL_STACK" ] && FULL_STACK="$(sed -n '1,200p' "$TMP_LAST")"
+elif [ "$TYPE" = "Native Crash" ]; then
+  FULL_STACK="$(sed -n '1,200p' "$TMP_LAST")"
+elif [ "$TYPE" = "ANR" ]; then
+  FULL_STACK="$(sed -n '1,200p' "$TMP_LAST")"
+fi
+
+# Top app frames (prefer your package)
+TOP_FRAMES=""
+if [ -n "$PKG" ] && [ -n "$FULL_STACK" ]; then
+  PKGRE="$(esc_sed "$PKG")"
+  TOP_FRAMES="$(printf "%s" "$FULL_STACK" | grep -E "^ *at .*${PKGRE}\." | head -n 10)"
+fi
+[ -z "$TOP_FRAMES" ] && TOP_FRAMES="$(printf "%s" "$FULL_STACK" | grep -E "^ *at " | head -n 10)"
+
+# Write full report
+{
+  echo "Device: $MODEL | Android $ANDROID (SDK $SDK)"
+  [ -n "$PKG" ] && echo "Package: $PKG"
+  echo "Type: ${TYPE:-Unknown}"
+  echo "Title: $TITLE"
+  echo "---"
+  if [ -n "$EX_SUMMARY" ]; then
+    echo "Exception: $EX_SUMMARY"
+  fi
+  if [ -n "$CAUSED" ]; then
+    echo "Caused by: $CAUSED"
+  fi
+  echo "---"
+  echo "Top app frames:"
+  if [ -n "$TOP_FRAMES" ]; then
+    echo "$TOP_FRAMES"
+  else
+    echo "(no app frames)"
+  fi
+  echo "---"
+  echo "Full stack (trimmed):"
+  if [ -n "$FULL_STACK" ]; then
+    echo "$FULL_STACK" | sed -n '1,200p'
+  else
+    sed -n '1,200p' "$TMP_LAST"
+  fi
+  echo "---"
+  echo "Context (last ~200 log lines):"
+  cat "$TMP_CTX"
+} > "$OUT"
+
+echo "Report → $(rel "$OUT")"
