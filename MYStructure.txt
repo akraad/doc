@@ -1,36 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Produces a minimal, machine-friendly project map as structure.txt
-Works on macOS (Apple Silicon M-series) with system Python 3.
-No external deps. No shell tricks. No GNU awk/sed required.
+Builds a minimal, machine-friendly project map (structure.txt)
+PLUS cross-file LINKS and WARNINGS (navigation, Hilt, Room, imports).
+Works on macOS/Linux with system Python 3. No external deps.
 """
 
 import os, re, sys
-
 ROOT = os.getcwd()
-OUT = os.path.join(ROOT, "structure.txt")
+OUT  = os.path.join(ROOT, "structure.txt")
 
-# Exclude heavy/irrelevant dirs
 SKIP_DIRS = {".git", ".gradle", ".idea", "build", ".DS_Store"}
 
 def walk_files(start, exts=None, names=None):
     for d, subdirs, files in os.walk(start):
-        # prune
         subdirs[:] = [s for s in subdirs if s not in SKIP_DIRS]
         for f in files:
-            if f in SKIP_DIRS:  # e.g. .DS_Store files
+            if f in SKIP_DIRS:
                 continue
-            path = os.path.join(d, f)
+            p = os.path.join(d, f)
             if names and f in names:
-                yield path
+                yield p
             elif exts and any(f.endswith(e) for e in exts):
-                yield path
+                yield p
 
-def read_text(path):
+def read_text(p):
     try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-            return fh.read()
+        return open(p, "r", encoding="utf-8", errors="ignore").read()
     except Exception:
         return ""
 
@@ -42,13 +38,13 @@ def write_section(w, title, lines):
             w.write(ln + "\n")
     w.write("\n")
 
-# Collect files
-gradles = list(walk_files(ROOT, names={"build.gradle", "build.gradle.kts"}))
-kts = list(walk_files(os.path.join("app","src","main"), exts={".kt",".kts"}))
+# --- collect files ---
+gradles   = list(walk_files(ROOT, names={"build.gradle", "build.gradle.kts"}))
+kts       = list(walk_files(os.path.join("app","src","main"), exts={".kt",".kts"}))
 manifests = list(walk_files(os.path.join("app","src","main"), names={"AndroidManifest.xml"}))
-all_src = list(walk_files(os.path.join("app","src","main"), exts={".kt",".kts",".xml"}))
+all_src   = list(walk_files(os.path.join("app","src","main"), exts={".kt",".kts",".xml"}))
 
-# Helpers
+# --- util ---
 def unique_sorted(seq):
     return sorted({s for s in seq if s and s.strip()})
 
@@ -59,12 +55,204 @@ def lines_containing(txt, *keys):
             out.append(line)
     return out
 
-# Build output
+# --- build index: package/class -> file ---
+pkg_of = {}           # file -> package.name
+classes_in_file = {}  # file -> set(class names)
+symbol_to_file = {}   # package.Class -> file
+
+pkg_re  = re.compile(r'^\s*package\s+([^\s]+)', re.M)
+class_re= re.compile(r'^\s*(?:class|data\s+class|object|interface|enum\s+class)\s+([A-Za-z0-9_]+)', re.M)
+import_re = re.compile(r'^\s*import\s+([A-Za-z0-9_.]+)', re.M)
+
+for f in kts:
+    txt = read_text(f)
+    pkg = None
+    m = pkg_re.search(txt)
+    if m: pkg = m.group(1)
+    pkg_of[f] = pkg or ""
+    cls = set(class_re.findall(txt))
+    classes_in_file[f] = cls
+    # register symbols
+    for c in cls:
+        if pkg:
+            symbol_to_file[f"{pkg}.{c}"] = f
+
+# --- collect existing routes / navigations ---
+routes_declared = set()
+routes_navigate = set()
+comp1 = re.compile(r'composable\("([^"]+)"\)')
+comp2 = re.compile(r'composable\([^)]*route\s*=\s*"([^"]+)"')
+nav_go= re.compile(r'\.navigate\(\s*"([^"]+)"')
+
+for f in kts:
+    t = read_text(f)
+    for r in comp1.findall(t): routes_declared.add(r)
+    for r in comp2.findall(t): routes_declared.add(r)
+    for r in nav_go.findall(t): routes_navigate.add(r)
+
+# --- Hilt/ViewModel usage ---
+hilt_vm_cls = set()   # fully-qualified if possible later
+hilt_vm_name= set()   # simple class names with @HiltViewModel
+hilt_vm_re  = re.compile(r'@HiltViewModel')
+hilt_app_re = re.compile(r'@HiltAndroidApp')
+hilt_entry  = re.compile(r'@AndroidEntryPoint')
+hilt_module = re.compile(r'@Module')
+hilt_install= re.compile(r'@InstallIn')
+
+hilt_hits = set()
+for f in kts:
+    txt = read_text(f)
+    for line in txt.splitlines():
+        if any(tag in line for tag in ["@HiltAndroidApp","@AndroidEntryPoint","@HiltViewModel","@Module","@InstallIn"]):
+            hilt_hits.add(line.strip())
+    if hilt_vm_re.search(txt):
+        # pick first class name in file as VM name (heuristic)
+        m = class_re.search(txt)
+        if m:
+            hilt_vm_name.add(m.group(1))
+
+# where hiltViewModel<T>() is used:
+hilt_usage = set()   # simple names collected
+hv_re = re.compile(r'hiltViewModel\s*<\s*([A-Za-z0-9_]+)\s*>')
+for f in kts:
+    for name in hv_re.findall(read_text(f)):
+        hilt_usage.add(name)
+
+# --- Room: @Database entities, @Dao present? ---
+db_entities = set()       # entity simple names declared in @Database(entities=[A::class, B::class])
+db_daos_declared = set()  # Dao interface simple names (@Dao)
+db_db_files = []          # files having @Database
+db_re = re.compile(r'@Database\(([^)]*)\)', re.S)
+entities_item = re.compile(r'entities\s*=\s*\[([^\]]*)\]', re.S)
+kclass_item = re.compile(r'([A-Za-z0-9_]+)\s*::\s*class')
+dao_re = re.compile(r'@Dao')
+
+for f in kts:
+    txt = read_text(f)
+    if dao_re.search(txt):
+        # take first interface/class name
+        m = class_re.search(txt)
+        if m: db_daos_declared.add(m.group(1))
+    mdb = db_re.search(txt)
+    if mdb:
+        db_db_files.append(f)
+        payload = mdb.group(1)
+        ment = entities_item.search(payload)
+        if ment:
+            inside = ment.group(1)
+            for e in kclass_item.findall(inside):
+                db_entities.add(e)
+
+# --- import-based links ---
+links = []
+for f in kts:
+    txt = read_text(f)
+    for imp in import_re.findall(txt):
+        # try resolve to a file
+        target = symbol_to_file.get(imp, None)
+        if target:
+            links.append(f"{os.path.relpath(f, ROOT)} -> {os.path.relpath(target, ROOT)} : import {imp}")
+        else:
+            # unresolved imports (external libs or other modules) -> skip
+            pass
+
+# --- navigation links (file-level) ---
+for f in kts:
+    t = read_text(f)
+    for r in comp1.findall(t):
+        links.append(f"{os.path.relpath(f, ROOT)} : composable route={r}")
+    for r in comp2.findall(t):
+        links.append(f"{os.path.relpath(f, ROOT)} : composable route={r}")
+    for r in nav_go.findall(t):
+        links.append(f"{os.path.relpath(f, ROOT)} : navigate route={r}")
+
+# --- Hilt links ---
+for f in kts:
+    t = read_text(f)
+    if hilt_vm_re.search(t):
+        # VM declared here
+        m = class_re.search(t)
+        if m:
+            vm = m.group(1)
+            links.append(f"{os.path.relpath(f, ROOT)} : @HiltViewModel {vm}")
+    if hilt_app_re.search(t):
+        links.append(f"{os.path.relpath(f, ROOT)} : @HiltAndroidApp")
+    if hilt_entry.search(t):
+        links.append(f"{os.path.relpath(f, ROOT)} : @AndroidEntryPoint")
+    if hilt_module.search(t):
+        links.append(f"{os.path.relpath(f, ROOT)} : @Module")
+    if hilt_install.search(t):
+        links.append(f"{os.path.relpath(f, ROOT)} : @InstallIn")
+
+# --- Room links ---
+for f in db_db_files:
+    links.append(f"{os.path.relpath(f, ROOT)} : @Database entities={','.join(sorted(db_entities))}")
+
+for f in kts:
+    t = read_text(f)
+    if dao_re.search(t):
+        m = class_re.search(t)
+        if m:
+            links.append(f"{os.path.relpath(f, ROOT)} : @Dao {m.group(1)}")
+
+# ===== WARNINGS =====
+warnings = []
+
+# 1) Navigation: routes used but not declared
+missing_composables = sorted(routes_navigate - routes_declared)
+if missing_composables:
+    for r in missing_composables:
+        warnings.append(f"WARN: route '{r}' is navigated but has no composable() declaration")
+
+# 2) Hilt: hiltViewModel<Foo> with no @HiltViewModel Foo
+missing_vm = sorted(hilt_usage - hilt_vm_name)
+if missing_vm:
+    for vm in missing_vm:
+        warnings.append(f"WARN: hiltViewModel<{vm}> used but no @HiltViewModel class named '{vm}' found")
+
+# 3) Room: @Database lists entities that do not exist as @Entity classes
+# collect all @Entity simple names
+entity_names = set()
+entity_re = re.compile(r'@Entity\(')
+for f in kts:
+    t = read_text(f)
+    if entity_re.search(t):
+        m = class_re.search(t)
+        if m: entity_names.add(m.group(1))
+missing_entities = sorted(db_entities - entity_names)
+if missing_entities:
+    for en in missing_entities:
+        warnings.append(f"WARN: @Database references entity '{en}' but no @Entity class named '{en}' found")
+
+# 4) Room: DAOs referenced in Database (optional—heuristic).
+#   اگر در AppDatabase امضای abstrac fun XxxDao(): XxxDao باشد، ببینیم XxxDao تعریف شده یا نه.
+dao_sig = re.compile(r'abstract\s+fun\s+([A-Za-z0-9_]+)\s*\(\s*\)\s*:\s*([A-Za-z0-9_]+)')
+for f in db_db_files:
+    t = read_text(f)
+    for m in dao_sig.findall(t):
+        _, ret = m
+        if ret not in db_daos_declared:
+            warnings.append(f"WARN: Database expects Dao '{ret}' but no @Dao interface named '{ret}' found")
+
+# 5) Duplicate routes (potential conflict)
+dup_routes = [r for r in sorted(routes_declared) if list(routes_declared).count(r) > 1]
+# (set count always 1; we need file-level duplicates)
+# quick pass: gather route -> files
+route_files = {}
+for f in kts:
+    t = read_text(f)
+    for r in comp1.findall(t) + comp2.findall(t):
+        route_files.setdefault(r, set()).add(os.path.relpath(f, ROOT))
+for r, fs in route_files.items():
+    if len(fs) > 1:
+        warnings.append(f"WARN: route '{r}' declared in multiple files: {', '.join(sorted(fs))}")
+
+# === write structure.txt ===
 with open(OUT, "w", encoding="utf-8") as w:
     # PROJECT
     write_section(w, "PROJECT", [f"root={os.path.basename(ROOT)}"])
 
-    # MODULES (settings.gradle*)
+    # MODULES
     modules = []
     for fname in ("settings.gradle", "settings.gradle.kts"):
         p = os.path.join(ROOT, fname)
@@ -72,43 +260,40 @@ with open(OUT, "w", encoding="utf-8") as w:
             txt = read_text(p)
             m = re.search(r"include\(([^)]+)\)", txt, re.S)
             if m:
-                inner = m.group(1)
-                parts = [x.strip().strip("'\"").lstrip(":") for x in inner.split(",")]
+                parts = [x.strip().strip("'\"").lstrip(":") for x in m.group(1).split(",")]
                 modules.extend([p for p in parts if p])
     write_section(w, "MODULES", unique_sorted(modules))
 
-    # ANDROID (namespace/applicationId/sdk)
+    # ANDROID
     android_lines = []
     for g in gradles:
-        for line in lines_containing(read_text(g), "namespace", "applicationId", "compileSdk", "minSdk", "targetSdk"):
-            line = re.sub(r"\s+", "", line).replace('"', '')
+        for line in lines_containing(read_text(g), "namespace","applicationId","compileSdk","minSdk","targetSdk"):
+            line = re.sub(r"\s+","", line).replace('"','')
             android_lines.append(line)
     write_section(w, "ANDROID", unique_sorted(android_lines))
 
-    # PLUGINS (id("..") و alias(..))
+    # PLUGINS
     plugin_ids = []
     for g in gradles:
-        txt = read_text(g)
-        plugin_ids += re.findall(r'id\("([^"]+)"\)', txt)
-        plugin_ids += [m.strip() for m in re.findall(r'alias\(([^)]+)\)', txt)]
+        t = read_text(g)
+        plugin_ids += re.findall(r'id\("([^"]+)"\)', t)
+        plugin_ids += [m.strip() for m in re.findall(r'alias\(([^)]+)\)', t)]
     write_section(w, "PLUGINS", unique_sorted(plugin_ids))
 
-    # DEPENDENCIES (group:artifact:version)
-    dep_pat = re.compile(
-        r'(?:implementation|api|kapt|ksp|testImplementation|androidTestImplementation|debugImplementation)\s*\(\s*["\']([^"\']+)["\']'
-    )
+    # DEPENDENCIES
+    dep_pat = re.compile(r'(?:implementation|api|kapt|ksp|testImplementation|androidTestImplementation|debugImplementation)\s*\(\s*["\']([^"\']+)["\']')
     deps = []
     for g in gradles:
         deps += dep_pat.findall(read_text(g))
     write_section(w, "DEPENDENCIES", unique_sorted(deps))
 
-    # COMPOSE (options + فایل‌های @Composable)
+    # COMPOSE
     compose_meta = []
     for g in gradles:
         for line in read_text(g).splitlines():
             if "composeOptions" in line or "kotlinCompilerExtensionVersion" in line:
-                line = re.sub(r'^[^:]+:', '', line.strip())
-                line = re.sub(r'\s+', '', line).replace('"','')
+                line = re.sub(r'^[^:]+:','',line.strip())
+                line = re.sub(r'\s+','',line).replace('"','')
                 compose_meta.append(line)
     composable_files = []
     for f in kts:
@@ -116,35 +301,28 @@ with open(OUT, "w", encoding="utf-8") as w:
             composable_files.append(f"{os.path.relpath(f, ROOT)}:@Composable")
     write_section(w, "COMPOSE", unique_sorted(compose_meta) + unique_sorted(composable_files))
 
-    # NAVIGATION (routes در composable)
-    routes = set()
-    comp1 = re.compile(r'composable\("([^"]+)"\)')
-    comp2 = re.compile(r'composable\([^)]*route\s*=\s*"([^"]+)"')
-    for f in kts:
-        txt = read_text(f)
-        for r in comp1.findall(txt): routes.add(f"route={r}")
-        for r in comp2.findall(txt): routes.add(f"route={r}")
-    write_section(w, "NAVIGATION", sorted(routes))
+    # NAVIGATION
+    write_section(w, "NAVIGATION", sorted({f"route={r}" for r in routes_declared} | {f"navigate={r}" for r in routes_navigate}))
 
     # HILT
-    hilt_hits = []
-    hilt_re = re.compile(r'@HiltAndroidApp|@AndroidEntryPoint|@HiltViewModel|@Module|@InstallIn')
+    hilt_lines = set()
+    tag_re = re.compile(r'@HiltAndroidApp|@AndroidEntryPoint|@HiltViewModel|@Module|@InstallIn')
     for f in kts:
         for line in read_text(f).splitlines():
-            if hilt_re.search(line):
-                hilt_hits.append(line.strip())
-    write_section(w, "HILT", unique_sorted(hilt_hits))
+            if tag_re.search(line):
+                hilt_lines.add(line.strip())
+    write_section(w, "HILT", unique_sorted(list(hilt_lines)))
 
-    # ROOM (+ dbVersion)
+    # ROOM
     room_lines, dbv = [], set()
-    db_re = re.compile(r'@Database\([^)]*version\s*=\s*([0-9]+)')
+    db_re2 = re.compile(r'@Database\([^)]*version\s*=\s*([0-9]+)')
     ann_re = re.compile(r'@Entity\(|@Dao|@Database\(')
     for f in kts:
-        txt = read_text(f)
-        for line in txt.splitlines():
+        t = read_text(f)
+        for line in t.splitlines():
             if ann_re.search(line):
                 room_lines.append(line.strip())
-        for m in db_re.findall(txt):
+        for m in db_re2.findall(t):
             dbv.add(f"dbVersion={m}")
     write_section(w, "ROOM", room_lines + sorted(dbv))
 
@@ -163,8 +341,7 @@ with open(OUT, "w", encoding="utf-8") as w:
     for m in manifests:
         for line in read_text(m).splitlines():
             if mani_re.search(line):
-                ln = re.sub(r'\s+', ' ', line).strip()
-                mani_out.append(ln)
+                mani_out.append(re.sub(r'\s+',' ', line).strip())
     write_section(w, "MANIFEST", mani_out)
 
     # PACKAGES
@@ -178,9 +355,10 @@ with open(OUT, "w", encoding="utf-8") as w:
     files_rel = [os.path.relpath(p, ROOT) for p in all_src]
     write_section(w, "FILES", sorted(files_rel))
 
-    # SUMMARY
-    kt_count = sum(1 for p in all_src if p.endswith(".kt"))
-    xml_count = sum(1 for p in all_src if p.endswith(".xml"))
-    write_section(w, "SUMMARY", [f"kotlin={kt_count}", f"xml={xml_count}"])
+    # LINKS
+    write_section(w, "LINKS", unique_sorted(links))
+
+    # WARNINGS
+    write_section(w, "WARNINGS", warnings)
 
 print("written: structure.txt")
