@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Produces a minimal, machine-friendly project map as structure.txt
+Works on macOS (Apple Silicon M-series) with system Python 3.
+No external deps. No shell tricks. No GNU awk/sed required.
+"""
+
+import os, re, sys
+
+ROOT = os.getcwd()
+OUT = os.path.join(ROOT, "structure.txt")
+
+# Exclude heavy/irrelevant dirs
+SKIP_DIRS = {".git", ".gradle", ".idea", "build", ".DS_Store"}
+
+def walk_files(start, exts=None, names=None):
+    for d, subdirs, files in os.walk(start):
+        # prune
+        subdirs[:] = [s for s in subdirs if s not in SKIP_DIRS]
+        for f in files:
+            if f in SKIP_DIRS:  # e.g. .DS_Store files
+                continue
+            path = os.path.join(d, f)
+            if names and f in names:
+                yield path
+            elif exts and any(f.endswith(e) for e in exts):
+                yield path
+
+def read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            return fh.read()
+    except Exception:
+        return ""
+
+def write_section(w, title, lines):
+    w.write(f"[{title}]\n")
+    for ln in lines:
+        ln = (ln or "").strip()
+        if ln:
+            w.write(ln + "\n")
+    w.write("\n")
+
+# Collect files
+gradles = list(walk_files(ROOT, names={"build.gradle", "build.gradle.kts"}))
+kts = list(walk_files(os.path.join("app","src","main"), exts={".kt",".kts"}))
+manifests = list(walk_files(os.path.join("app","src","main"), names={"AndroidManifest.xml"}))
+all_src = list(walk_files(os.path.join("app","src","main"), exts={".kt",".kts",".xml"}))
+
+# Helpers
+def unique_sorted(seq):
+    return sorted({s for s in seq if s and s.strip()})
+
+def lines_containing(txt, *keys):
+    out = []
+    for line in txt.splitlines():
+        if any(k in line for k in keys):
+            out.append(line)
+    return out
+
+# Build output
+with open(OUT, "w", encoding="utf-8") as w:
+    # PROJECT
+    write_section(w, "PROJECT", [f"root={os.path.basename(ROOT)}"])
+
+    # MODULES (settings.gradle*)
+    modules = []
+    for fname in ("settings.gradle", "settings.gradle.kts"):
+        p = os.path.join(ROOT, fname)
+        if os.path.isfile(p):
+            txt = read_text(p)
+            m = re.search(r"include\(([^)]+)\)", txt, re.S)
+            if m:
+                inner = m.group(1)
+                parts = [x.strip().strip("'\"").lstrip(":") for x in inner.split(",")]
+                modules.extend([p for p in parts if p])
+    write_section(w, "MODULES", unique_sorted(modules))
+
+    # ANDROID (namespace/applicationId/sdk)
+    android_lines = []
+    for g in gradles:
+        for line in lines_containing(read_text(g), "namespace", "applicationId", "compileSdk", "minSdk", "targetSdk"):
+            line = re.sub(r"\s+", "", line).replace('"', '')
+            android_lines.append(line)
+    write_section(w, "ANDROID", unique_sorted(android_lines))
+
+    # PLUGINS (id("..") و alias(..))
+    plugin_ids = []
+    for g in gradles:
+        txt = read_text(g)
+        plugin_ids += re.findall(r'id\("([^"]+)"\)', txt)
+        plugin_ids += [m.strip() for m in re.findall(r'alias\(([^)]+)\)', txt)]
+    write_section(w, "PLUGINS", unique_sorted(plugin_ids))
+
+    # DEPENDENCIES (group:artifact:version)
+    dep_pat = re.compile(
+        r'(?:implementation|api|kapt|ksp|testImplementation|androidTestImplementation|debugImplementation)\s*\(\s*["\']([^"\']+)["\']'
+    )
+    deps = []
+    for g in gradles:
+        deps += dep_pat.findall(read_text(g))
+    write_section(w, "DEPENDENCIES", unique_sorted(deps))
+
+    # COMPOSE (options + فایل‌های @Composable)
+    compose_meta = []
+    for g in gradles:
+        for line in read_text(g).splitlines():
+            if "composeOptions" in line or "kotlinCompilerExtensionVersion" in line:
+                line = re.sub(r'^[^:]+:', '', line.strip())
+                line = re.sub(r'\s+', '', line).replace('"','')
+                compose_meta.append(line)
+    composable_files = []
+    for f in kts:
+        if "@Composable" in read_text(f):
+            composable_files.append(f"{os.path.relpath(f, ROOT)}:@Composable")
+    write_section(w, "COMPOSE", unique_sorted(compose_meta) + unique_sorted(composable_files))
+
+    # NAVIGATION (routes در composable)
+    routes = set()
+    comp1 = re.compile(r'composable\("([^"]+)"\)')
+    comp2 = re.compile(r'composable\([^)]*route\s*=\s*"([^"]+)"')
+    for f in kts:
+        txt = read_text(f)
+        for r in comp1.findall(txt): routes.add(f"route={r}")
+        for r in comp2.findall(txt): routes.add(f"route={r}")
+    write_section(w, "NAVIGATION", sorted(routes))
+
+    # HILT
+    hilt_hits = []
+    hilt_re = re.compile(r'@HiltAndroidApp|@AndroidEntryPoint|@HiltViewModel|@Module|@InstallIn')
+    for f in kts:
+        for line in read_text(f).splitlines():
+            if hilt_re.search(line):
+                hilt_hits.append(line.strip())
+    write_section(w, "HILT", unique_sorted(hilt_hits))
+
+    # ROOM (+ dbVersion)
+    room_lines, dbv = [], set()
+    db_re = re.compile(r'@Database\([^)]*version\s*=\s*([0-9]+)')
+    ann_re = re.compile(r'@Entity\(|@Dao|@Database\(')
+    for f in kts:
+        txt = read_text(f)
+        for line in txt.splitlines():
+            if ann_re.search(line):
+                room_lines.append(line.strip())
+        for m in db_re.findall(txt):
+            dbv.add(f"dbVersion={m}")
+    write_section(w, "ROOM", room_lines + sorted(dbv))
+
+    # DATASTORE
+    ds_lines = []
+    ds_re = re.compile(r'DataStore|preferencesDataStore\(|Serializer')
+    for f in kts:
+        for line in read_text(f).splitlines():
+            if ds_re.search(line):
+                ds_lines.append(line.strip())
+    write_section(w, "DATASTORE", unique_sorted(ds_lines))
+
+    # MANIFEST
+    mani_out = []
+    mani_re = re.compile(r'<application|<activity|android:name=|android:exported=')
+    for m in manifests:
+        for line in read_text(m).splitlines():
+            if mani_re.search(line):
+                ln = re.sub(r'\s+', ' ', line).strip()
+                mani_out.append(ln)
+    write_section(w, "MANIFEST", mani_out)
+
+    # PACKAGES
+    pkgs = set()
+    for f in kts:
+        m = re.search(r'^\s*package\s+([^\s]+)', read_text(f), re.M)
+        if m: pkgs.add(m.group(1))
+    write_section(w, "PACKAGES", sorted(pkgs))
+
+    # FILES
+    files_rel = [os.path.relpath(p, ROOT) for p in all_src]
+    write_section(w, "FILES", sorted(files_rel))
+
+    # SUMMARY
+    kt_count = sum(1 for p in all_src if p.endswith(".kt"))
+    xml_count = sum(1 for p in all_src if p.endswith(".xml"))
+    write_section(w, "SUMMARY", [f"kotlin={kt_count}", f"xml={xml_count}"])
+
+print("written: structure.txt")
