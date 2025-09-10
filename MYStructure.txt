@@ -8,7 +8,7 @@ Works on macOS/Linux with system Python 3. No external deps.
 
 import os, re, sys
 ROOT = os.getcwd()
-OUT  = os.path.join(ROOT, "structure.txt")
+OUT  = os.path.join(ROOT, "Structure.txt")
 
 SKIP_DIRS = {".git", ".gradle", ".idea", "build", ".DS_Store"}
 
