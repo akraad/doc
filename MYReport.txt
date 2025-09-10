@@ -10,13 +10,13 @@ emulate -L zsh
 setopt NULL_GLOB
 
 ROOT="$(pwd)"
-OUT_DIR="$ROOT/report"
+OUT_DIR="$ROOT/Report"
 TMP_DIR="$OUT_DIR/.tmp"
 mkdir -p "$OUT_DIR" "$TMP_DIR"
 
-CONTENT_OUT="$OUT_DIR/content.txt"
-ROOT_OUT="$OUT_DIR/root.txt"
-ERROR_OUT="$OUT_DIR/error.txt"
+CONTENT_OUT="$OUT_DIR/Content.txt"
+ROOT_OUT="$OUT_DIR/Root.txt"
+ERROR_OUT="$OUT_DIR/ContError.txt"
 
 : > "$CONTENT_OUT"
 : > "$ROOT_OUT"
