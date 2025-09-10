@@ -10,6 +10,12 @@
 مدیریت تنظیمات: Jetpack DataStore
 ناوبری: Navigation Compose
 
+Theme And UI:
+رنگ‌ها و پالت: Material3 Dynamic Colors
+فونت وزیر Typography Material3 
+شکل اجزای UI (Rounded corners, Elevation, Shadows)
+RTL support 
+Dark/Light theme toggle؟
 
 فونت برنامه وزیر متن با این ساختار:
 vazirmatn_black.ttf
