@@ -2,7 +2,7 @@
 # Reliable Android/Kotlin error reporter → MyAppErrors.txt (macOS bash/zsh)
 
 set +e
-OUT="MyAppErrors.txt"; : > "$OUT"
+OUT="Errors.txt"; : > "$OUT"
 BUILD_LOG=".my_build.log"; : > "$BUILD_LOG"
 SYNC_LOG=".my_sync.log";  : > "$SYNC_LOG"
 
