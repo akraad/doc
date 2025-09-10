@@ -1,0 +1,24 @@
+من می‌خوام یک اپلیکیشن اندروید با Kotlin و Jetpack Compose ساخته بشه.  
+اطلاعات پایه پروژه:
+
+معماری و تکنولوژی‌های مورد استفاده:
+زبان: Kotlin
+رابط کاربری: Jetpack Compose (Material3, Tooling, UI, BOM)
+معماری: MVVM (Model-View-ViewModel)
+تزریق وابستگی: Hilt
+پایگاه داده: Room (KSP)
+مدیریت تنظیمات: Jetpack DataStore
+ناوبری: Navigation Compose
+
+
+فونت برنامه وزیر متن با این ساختار:
+vazirmatn_black.ttf
+vazirmatn_bold.ttf
+vazirmatn_extrabold.ttf
+vazirmatn_extralight.ttf
+vazirmatn_light.ttf
+vazirmatn_medium.ttf
+vazirmatn_regular.ttf
+vazirmatn_semibold.ttf
+vazirmatn_thin.ttf
+
