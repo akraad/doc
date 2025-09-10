@@ -1,0 +1,6 @@
+
+
+gradle.properties
+
+ksp.incremental=false
+
