@@ -5,7 +5,7 @@ gradle.properties
 ksp.incremental=false
 
 -----------------------
-
+فقط ساختار جدول words را به ما نشان می‌دهد.
 نمایش اطلاعات ستون:
 
 PRAGMA table_info(words);
