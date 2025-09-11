@@ -4,3 +4,11 @@ gradle.properties
 
 ksp.incremental=false
 
+-----------------------
+
+نمایش اطلاعات ستون:
+
+PRAGMA table_info(words);
+
+
+----------
