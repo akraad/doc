@@ -12,3 +12,6 @@ PRAGMA table_info(words);
 
 
 ----------
+
+./gradlew signingReport
+
