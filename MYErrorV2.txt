@@ -1,0 +1,65 @@
+#!/bin/bash
+
+# --- پیکربندی ---
+BUILD_COMMAND="./gradlew assembleDebug --no-daemon"
+RAW_LOG_FILE="build_output.log"
+ERROR_REPORT_FILE="Error.txt"
+
+# --- شروع اسکریپت ---
+
+echo ">>> مرحله ۱: اجرای بیلد Debug و ذخیره خروجی..."
+$BUILD_COMMAND > "$RAW_LOG_FILE" 2>&1
+
+if [ $? -eq 0 ]; then
+    echo "✅ بیلد موفقیت‌آمیز بود. هیچ خطایی برای گزارش وجود ندارد."
+    echo "Build was successful. No errors found." > "$ERROR_REPORT_FILE"
+    exit 0
+fi
+
+echo ">>> مرحله ۲: بیلد ناموفق بود. در حال استخراج فایل‌های دارای خطا..."
+> "$ERROR_REPORT_FILE"
+
+errored_files=$(grep -Eo "file:///[^:]+\.kt" "$RAW_LOG_FILE" | sed 's|file://||' | sort -u)
+
+if [ -z "$errored_files" ]; then
+    echo "⚠️ بیلد ناموفق بود، اما هیچ خطای مشخصی برای فایل‌ها پیدا نشد."
+    echo "لطفاً لاگ کامل را در فایل '$RAW_LOG_FILE' برای یافتن دلیل اصلی بررسی کنید."
+    echo "--- ۲۰ خط آخر از لاگ کامل بیلد: ---"
+    tail -n 20 "$RAW_LOG_FILE"
+    exit 1
+fi
+
+echo ">>> مرحله ۳: خطاها پیدا شدند. در حال ایجاد گزارش کامل..."
+echo "$errored_files"
+echo ""
+
+# --- تغییر اصلی اینجاست: استفاده از pipe | به جای <<< ---
+echo "$errored_files" | while IFS= read -r filepath; do
+    if [ ! -f "$filepath" ]; then
+        echo "Warning: File not found at path '$filepath', skipping."
+        continue
+    fi
+
+    filename=$(basename "$filepath")
+    error_codes=$(grep -F "$filepath" "$RAW_LOG_FILE")
+
+    {
+        echo "File Name: $filename"
+        echo "Address: $filepath"
+        echo ""
+        echo "--- Error Codes from Build Output ---"
+        if [ -z "$error_codes" ]; then
+            echo "No specific error lines found for this file."
+        else
+            echo "$error_codes"
+        fi
+        echo ""
+        echo "--- Full Code of the File ---"
+        cat "$filepath"
+        echo ""
+        echo "========================================================================"
+        echo ""
+    } >> "$ERROR_REPORT_FILE"
+done
+
+echo "✅ انجام شد. گزارش کامل خطاها در فایل '$ERROR_REPORT_FILE' ذخیره شد."
